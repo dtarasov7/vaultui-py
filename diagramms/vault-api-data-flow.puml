@@ -1,0 +1,34 @@
+@startuml
+title VaultUI Python - Vault API Data Flow
+
+skinparam shadowing false
+
+actor "User" as User
+participant "View" as View
+participant "VaultClient" as Client
+participant "TTLCache" as Cache
+participant "Vault HTTP API" as Vault
+participant "Renderer" as Renderer
+participant "Clipboard" as Clipboard
+
+User -> View : key press / command
+View -> Client : request data
+Client -> Cache : lookup cache key
+alt cache hit
+  Cache --> Client : cached value
+else cache miss
+  Client -> Vault : GET / LIST / POST /v1/...
+  Vault --> Client : JSON response
+  Client -> Cache : store cacheable response
+end
+Client --> View : normalized dict/list
+View -> Renderer : table, detail, text, raw JSON/YAML
+Renderer --> User : terminal frame
+
+opt copy action
+  User -> View : c or C
+  View -> Clipboard : selected value or raw JSON
+  Clipboard --> User : status message
+end
+
+@enduml

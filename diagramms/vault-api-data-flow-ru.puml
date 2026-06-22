@@ -1,0 +1,34 @@
+@startuml
+title VaultUI Python - Поток данных Vault API
+
+skinparam shadowing false
+
+actor "Пользователь" as User
+participant "Экран View" as View
+participant "VaultClient" as Client
+participant "TTLCache" as Cache
+participant "Vault HTTP API" as Vault
+participant "Renderer" as Renderer
+participant "Clipboard" as Clipboard
+
+User -> View : клавиша / команда
+View -> Client : запрос данных
+Client -> Cache : поиск по cache key
+alt попадание в кеш
+  Cache --> Client : кешированное значение
+else промах кеша
+  Client -> Vault : GET / LIST / POST /v1/...
+  Vault --> Client : JSON-ответ
+  Client -> Cache : сохранить кешируемый ответ
+end
+Client --> View : нормализованные dict/list
+View -> Renderer : table, detail, text, raw JSON/YAML
+Renderer --> User : кадр терминала
+
+opt копирование
+  User -> View : c или C
+  View -> Clipboard : выбранное значение или raw JSON
+  Clipboard --> User : статусное сообщение
+end
+
+@enduml

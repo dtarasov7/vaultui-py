@@ -1,0 +1,45 @@
+@startuml
+title VaultUI Python - Поток выполнения
+
+skinparam shadowing false
+
+start
+:Разобрать аргументы CLI;
+if (подкоманда == get?) then (да)
+  :Собрать RuntimeConfig;
+  :Создать VaultClient;
+  if (метод auth token?) then (да)
+  else (нет)
+    :Войти через userpass или AppRole;
+  endif
+  :Прочитать запрошенный ресурс Vault;
+  :Вывести JSON;
+  stop
+else (интерактивный TUI)
+  :Собрать RuntimeConfig;
+  :Создать VaultClient;
+  if (метод auth token?) then (да)
+  else (нет)
+    :Войти через userpass или AppRole;
+  endif
+  :Запустить TokenRenewer;
+  :Инициализировать curses;
+  :Открыть DashboardView;
+  repeat
+    :Обновить health в заголовке при устаревании;
+    :Отрисовать заголовок, экран и status bar;
+    :Прочитать клавишу;
+    if (режим команд?) then (да)
+      :Редактировать или выполнить command palette;
+    elseif (глобальная клавиша?) then (да)
+      :Quit, help, back или quick jump;
+    else (клавиша экрана)
+      :Передать клавишу текущему View;
+    endif
+  repeat while (running)
+  :Остановить TokenRenewer;
+  :Восстановить терминал;
+  stop
+endif
+
+@enduml

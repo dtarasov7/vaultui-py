@@ -1,0 +1,53 @@
+@startuml
+title VaultUI Python - TUI Navigation
+
+skinparam shadowing false
+
+[*] --> Dashboard
+
+Dashboard --> Engines : 1 or :secrets
+Dashboard --> AuthMethods : 2 or :auth
+Dashboard --> Policies : 3 or :policies
+Dashboard --> Identity : 4 or :identity
+Dashboard --> PKI : 5 or :pki
+Dashboard --> Transit : 6 or :transit
+Dashboard --> Database : 7 or :db
+Dashboard --> AWS : 8 or :aws
+Dashboard --> TokenInspector : :token
+Dashboard --> Contexts : :ctx
+
+Engines --> PathBrowser : enter on KV/other engine
+Engines --> PKI : enter on pki engine
+Engines --> Transit : enter on transit engine
+Engines --> Database : enter on database engine
+Engines --> AWS : enter on aws engine
+Engines --> EngineDetail : d or J/y
+
+PathBrowser --> PathBrowser : enter directory
+PathBrowser --> SecretDetail : enter secret
+SecretDetail --> Versions : v on KV v2
+Versions --> SecretDetail : enter version
+Versions --> Diff : d
+
+Policies --> PolicyDetail : enter
+PKI --> PKICertDetail : enter certificate
+PKI --> StaticDetail : enter role
+Transit --> TransitKeyDetail : enter
+Identity --> IdentityDetail : enter entity/group
+Database --> DBConnectionDetail : enter connection
+Database --> DBRoleDetail : enter dynamic role
+Database --> DBStaticRoleDetail : enter static role
+AWS --> AWSRoleDetail : enter role
+AWS --> StaticDetail : enter lease
+Contexts --> Dashboard : enter selected context
+
+state "Any Detail View" as Detail
+Detail --> RawMode : J/y
+RawMode --> Detail : esc or same format key
+
+state "Any View" as Any
+Any --> Dashboard : :dash
+Any --> [*] : q or :quit
+Any --> PreviousView : esc
+
+@enduml

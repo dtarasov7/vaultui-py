@@ -1,0 +1,45 @@
+@startuml
+title VaultUI Python - Runtime Flow
+
+skinparam shadowing false
+
+start
+:Parse CLI arguments;
+if (subcommand == get?) then (yes)
+  :Resolve RuntimeConfig;
+  :Create VaultClient;
+  if (auth method is token?) then (yes)
+  else (no)
+    :Authenticate via userpass or AppRole;
+  endif
+  :Read requested Vault resource;
+  :Print formatted JSON;
+  stop
+else (interactive TUI)
+  :Resolve RuntimeConfig;
+  :Create VaultClient;
+  if (auth method is token?) then (yes)
+  else (no)
+    :Authenticate via userpass or AppRole;
+  endif
+  :Start TokenRenewer;
+  :Initialize curses;
+  :Push DashboardView;
+  repeat
+    :Refresh header health when stale;
+    :Render header, current view, status bar;
+    :Read key token;
+    if (command mode?) then (yes)
+      :Edit or execute command palette;
+    elseif (global key?) then (yes)
+      :Quit, help, back, or quick jump;
+    else (view key)
+      :Delegate key to current View;
+    endif
+  repeat while (running)
+  :Stop TokenRenewer;
+  :Restore terminal;
+  stop
+endif
+
+@enduml

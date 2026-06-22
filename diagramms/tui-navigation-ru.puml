@@ -1,0 +1,53 @@
+@startuml
+title VaultUI Python - Навигация TUI
+
+skinparam shadowing false
+
+[*] --> Dashboard
+
+Dashboard --> Engines : 1 или :secrets
+Dashboard --> AuthMethods : 2 или :auth
+Dashboard --> Policies : 3 или :policies
+Dashboard --> Identity : 4 или :identity
+Dashboard --> PKI : 5 или :pki
+Dashboard --> Transit : 6 или :transit
+Dashboard --> Database : 7 или :db
+Dashboard --> AWS : 8 или :aws
+Dashboard --> TokenInspector : :token
+Dashboard --> Contexts : :ctx
+
+Engines --> PathBrowser : enter на KV/другом engine
+Engines --> PKI : enter на pki engine
+Engines --> Transit : enter на transit engine
+Engines --> Database : enter на database engine
+Engines --> AWS : enter на aws engine
+Engines --> EngineDetail : d или J/y
+
+PathBrowser --> PathBrowser : enter на каталог
+PathBrowser --> SecretDetail : enter на secret
+SecretDetail --> Versions : v на KV v2
+Versions --> SecretDetail : enter на версию
+Versions --> Diff : d
+
+Policies --> PolicyDetail : enter
+PKI --> PKICertDetail : enter на сертификат
+PKI --> StaticDetail : enter на роль
+Transit --> TransitKeyDetail : enter
+Identity --> IdentityDetail : enter entity/group
+Database --> DBConnectionDetail : enter connection
+Database --> DBRoleDetail : enter dynamic role
+Database --> DBStaticRoleDetail : enter static role
+AWS --> AWSRoleDetail : enter role
+AWS --> StaticDetail : enter lease
+Contexts --> Dashboard : enter на выбранный контекст
+
+state "Любой detail-экран" as Detail
+Detail --> RawMode : J/y
+RawMode --> Detail : esc или та же клавиша формата
+
+state "Любой экран" as Any
+Any --> Dashboard : :dash
+Any --> [*] : q или :quit
+Any --> PreviousView : esc
+
+@enduml

@@ -1,0 +1,45 @@
+@startuml
+title VaultUI Python - Component Architecture
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam packageStyle rectangle
+
+actor "Terminal User" as User
+
+package "vaultui-py.py" {
+  component "CLI Parser\nargparse" as CLI
+  component "Runtime Config\nflags/env/~/.vaultui.yaml" as Config
+  component "VaultTUI\ncurses app controller" as App
+  component "Router Stack\nView push/pop/reset" as Router
+  component "Views\nDashboard, KV, Policies,\nAuth, PKI, Transit,\nIdentity, DB, AWS" as Views
+  component "UI Primitives\nTable, DetailView,\nTextView, Theme, KeyMap" as UI
+  component "VaultClient\nurllib HTTP API" as Client
+  component "TTLCache\n30s endpoint cache" as Cache
+  component "TokenRenewer\nbackground renew-self" as Renewer
+  component "Clipboard\nOS copy + auto-clear" as Clipboard
+  component "Headless get\nJSON output" as Get
+}
+
+cloud "HashiCorp Vault\n/v1 HTTP API" as Vault
+database "~/.vaultui.yaml\n~/.vault-token" as Files
+collections "OS Clipboard Tools\nxclip/xsel/wl-copy/pbcopy/clip" as ClipboardTools
+
+User --> CLI : starts TUI or get
+CLI --> Config : resolves connection
+Config --> Files : reads/writes contexts
+CLI --> App : interactive mode
+CLI --> Get : get subcommand
+App --> Router : manages navigation
+Router --> Views : current screen
+Views --> UI : render and handle keys
+Views --> Client : load Vault data
+Get --> Client : read resource
+Client --> Cache : cache reads
+Client --> Vault : GET/LIST/POST
+App --> Renewer : starts token renewal
+Renewer --> Client : lookup/renew token
+Views --> Clipboard : copy values/raw data
+Clipboard --> ClipboardTools : write and clear
+
+@enduml

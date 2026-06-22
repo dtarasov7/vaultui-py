@@ -1,0 +1,45 @@
+@startuml
+title VaultUI Python - Компонентная архитектура
+
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam packageStyle rectangle
+
+actor "Пользователь терминала" as User
+
+package "vaultui-py.py" {
+  component "CLI-парсер\nargparse" as CLI
+  component "Runtime-конфиг\nфлаги/env/~/.vaultui.yaml" as Config
+  component "VaultTUI\nконтроллер curses-приложения" as App
+  component "Стек маршрутизации\npush/pop/reset экранов" as Router
+  component "Экраны\nDashboard, KV, Policies,\nAuth, PKI, Transit,\nIdentity, DB, AWS" as Views
+  component "UI-примитивы\nTable, DetailView,\nTextView, Theme, KeyMap" as UI
+  component "VaultClient\nHTTP API через urllib" as Client
+  component "TTLCache\nкеш endpoint-ов на 30 секунд" as Cache
+  component "TokenRenewer\nфоновое продление токена" as Renewer
+  component "Clipboard\nкопирование и автоочистка" as Clipboard
+  component "Headless get\nJSON-вывод" as Get
+}
+
+cloud "HashiCorp Vault\nHTTP API /v1" as Vault
+database "~/.vaultui.yaml\n~/.vault-token" as Files
+collections "Утилиты буфера обмена\nxclip/xsel/wl-copy/pbcopy/clip" as ClipboardTools
+
+User --> CLI : запускает TUI или get
+CLI --> Config : собирает параметры подключения
+Config --> Files : читает/сохраняет контексты
+CLI --> App : интерактивный режим
+CLI --> Get : подкоманда get
+App --> Router : управляет навигацией
+Router --> Views : текущий экран
+Views --> UI : рендер и обработка клавиш
+Views --> Client : загружает данные Vault
+Get --> Client : читает ресурс
+Client --> Cache : кеширует чтения
+Client --> Vault : GET/LIST/POST
+App --> Renewer : запускает продление токена
+Renewer --> Client : lookup/renew token
+Views --> Clipboard : копирует значения/raw data
+Clipboard --> ClipboardTools : запись и очистка
+
+@enduml
