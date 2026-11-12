@@ -1,6 +1,6 @@
 # VaultUI Python
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](CHANGELOG.md)
 
 VaultUI Python is a single-file Python 3.8 terminal UI for HashiCorp Vault. It mirrors the main workflows of the original Go `vaultui` project while keeping runtime dependencies minimal: the application uses the Python standard library for CLI parsing, HTTP requests, curses rendering, clipboard integration, and JSON output.
 
@@ -137,6 +137,12 @@ Headless JSON mode:
 
 ## TUI Navigation
 
+Letter shortcuts work with English and Russian layouts regardless of Caps Lock:
+`j/J/о/О` moves down, `k/K/л/Л` moves up, `r/R/к/К` refreshes, and `q/Q/й/Й`
+quits. Filter and command palette input stays literal. Russian-layout `.` opens
+the filter and `,` opens help. To keep actions independent of letter case, the
+former `J`, `C` and `G` actions now use `F2` (JSON), `F4` (copy JSON) and `End`.
+
 | Key | Action |
 | --- | --- |
 | `j` / `Down` | Move down |
@@ -144,14 +150,14 @@ Headless JSON mode:
 | `Enter` | Open selected item |
 | `Esc` / `Left` | Go back |
 | `g` / `Home` | Jump to top |
-| `G` / `End` | Jump to bottom |
+| `End` | Jump to bottom |
 | `Ctrl+D` | Page down |
 | `Ctrl+U` | Page up |
 | `/` | Filter table rows |
 | `r` | Refresh current view |
 | `c` | Copy selected value or text |
-| `C` | Copy secret as JSON |
-| `J` / `y` | Toggle raw JSON/YAML view |
+| `F4` | Copy secret as JSON |
+| `F2` / `y` | Toggle raw JSON/YAML view |
 | `v` | Open KV v2 version history |
 | `d` | Describe engine or diff versions |
 | `Tab` | Switch tabs where available |
@@ -159,10 +165,17 @@ Headless JSON mode:
 | `?` | Show help |
 | `q` | Quit |
 
-Quick jumps:
+Tabs stay visible below the header, with the active tab highlighted. Switching
+by number preserves each section's screen, filter, and selection. Pressing the
+active number keeps the current screen; `r` refreshes views that support it.
+The tab bar wraps on narrow terminals. `Esc` goes back within the section, then
+returns to the overview from its root. `Tab` still switches internal view tabs.
+
+Tab numbers:
 
 | Key | Screen |
 | --- | --- |
+| `0` | Overview (Dashboard) |
 | `1` | Secret Engines |
 | `2` | Auth Methods |
 | `3` | Policies |
@@ -171,6 +184,63 @@ Quick jumps:
 | `6` | Transit |
 | `7` | Database |
 | `8` | AWS |
+
+## Complete Vault data in the TUI
+
+List tables are summaries. Detail screens retain every backend response field,
+including fields added by newer Vault versions. Press `Enter` on a property to
+read its complete value with wrapping and scrolling, including SQL, PEM, JSON,
+arrays and nested objects. `c` copies a value, `F4` copies JSON, and `F2` / `y`
+show JSON / YAML. Empty strings, `false`, `0`, `[]`, `{}` and `null` stay distinct.
+
+Each scrollable area shows its position, for example `[^ 11-20/50 v]`:
+rows 11–20 of 50 are visible, `^` means more content above, `v` means more
+below, and `-` marks that boundary as reached. Tables count filtered rows;
+text counts lines after wrapping to terminal width. The two Policies panes
+have independent indicators.
+
+| Tab | Information available |
+| --- | --- |
+| `0` Overview | `Enter` / `d`: full health, seal-status, HA-status, resource counts and read errors |
+| `1` Secrets | `d`: complete mount properties; KV values, `m` for full KV v2 metadata, `v` for versions and diff |
+| `2` Auth | `Enter`: backend configuration (including all LDAP fields), `[mount]` and `[tuning]`; `b`: method users, groups, roles and other resources |
+| `3` Policies | List above the selected policy body; arrows select, `PgUp/PgDn` scroll the preview, `Enter` opens full screen; `d` / `F2` / `y`: API response; `b`: ACL, RGP and EGP collections when supported |
+| `4` Identity | Complete entities/groups, metadata, aliases and membership; `b`: alias collections and OIDC resources |
+| `5` PKI | Complete roles and certificate responses; `b`: issuers, keys, URL/CRL/cluster/auto-tidy configuration |
+| `6` Transit | All key properties, versions and settings; `b`: keys and cache configuration |
+| `7` Database | All connection and dynamic/static role fields, including connection_details, SQL, TTL and rotation settings |
+| `8` AWS | Complete roles, root/lease configuration and lease lookup; `Enter` on Config opens its API response |
+| `:token`, `:ctx` | Every token lookup field; `d` on a context shows its complete saved configuration |
+
+Press `b` to browse common API endpoints for the current section. Selecting an
+endpoint reads it. Use the command palette for any exact Vault API path:
+
+```text
+:read auth/ldap/config
+:read sys/auth/ldap/tune
+:list auth/ldap/groups
+:read pki/roles/example
+:read secret/metadata/apps/myapp/config
+:read secret/data/apps/myapp/config version=2
+```
+
+Paths follow `vault read` / `vault list` semantics without KV path conversion.
+In API lists, `Enter` opens an item, `l` lists its children, and `d` reads it.
+`F2` / `y` show the complete list response, including `key_info`. For `:read`,
+JSON / YAML also retains the response envelope, warnings and lease metadata.
+
+Use `m` in PKI/Transit/Database/AWS to select any mounted instance, including
+custom mount paths. `Tab` switches internal collections. A failed collection
+does not hide available neighboring collections. Press `!` for the full screen
+error. `r` clears the cache and reads tables/details again.
+
+Results depend on the same token permissions, namespace and Vault configuration
+as the CLI. Unsupported endpoints and permission errors are visible; values
+withheld by Vault cannot be recovered. The endpoint catalogue does not generate
+credentials or modify configuration.
+
+API references: [LDAP configuration](https://developer.hashicorp.com/vault/api-docs/auth/ldap),
+[auth mount tuning](https://developer.hashicorp.com/vault/api-docs/system/auth).
 
 ## Project Files
 
@@ -196,8 +266,15 @@ Useful local checks:
 
 ```bash
 python3 -m py_compile vaultui-py.py
+python3 -m unittest discover -s tests -v
 sh -n seed-vault-dev.sh
 VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root ./vaultui-py.py get health
+```
+
+Compare tab data with a running local Vault and the installed Vault CLI:
+
+```bash
+VAULTUI_LIVE_TESTS=1 VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=root python3 -m unittest discover -s tests -p test_live_information.py -v
 ```
 
 ## Author

@@ -33,6 +33,7 @@ import curses
 import difflib
 import json
 import os
+import shlex
 import ssl
 import subprocess
 import sys
@@ -42,14 +43,14 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 
 APP_NAME = "VaultUI Python"
-__VERSION__ = "1.0.0"
+__VERSION__ = "1.1.0"
 __AUTHOR__ = "Dmitry Tarasov"
 
 DEFAULT_CONFIG_NAME = ".vaultui.yaml"
@@ -829,6 +830,7 @@ class VaultClient:
                 version = "v%s" % options.get("version")
             entries.append(
                 {
+                    **mount,
                     "path": path,
                     "type": mount.get("type", ""),
                     "description": mount.get("description", ""),
@@ -855,6 +857,7 @@ class VaultClient:
         for path, auth in data.items():
             entries.append(
                 {
+                    **auth,
                     "path": path,
                     "type": auth.get("type", ""),
                     "description": auth.get("description", ""),
@@ -887,7 +890,9 @@ class VaultClient:
         # Vault отдаёт collection endpoints через LIST, не GET.
         # Старые установки могут поддерживать legacy sys/policy.
         try:
-            response = self.list("sys/policies/acl") or {}
+            response = self.list("sys/policies/acl")
+            if response is None:
+                response = self.list("sys/policy") or {}
         except VaultError as first_error:
             response = self.list("sys/policy")
             if response is None:
@@ -910,28 +915,7 @@ class VaultClient:
             return cached
         response = self.read(vault_join("sys/mounts", path.rstrip("/"))) or {}
         data = response.get("data") or response
-        config = data.get("config") or {}
-        result = {
-            "Path": ensure_slash(path),
-            "Type": data.get("type", ""),
-            "Description": data.get("description", ""),
-            "UUID": data.get("uuid", ""),
-            "Accessor": data.get("accessor", ""),
-            "Plugin Version": data.get("plugin_version", ""),
-            "Running Version": data.get("running_version", ""),
-            "Local": bool(data.get("local", False)),
-            "Seal Wrap": bool(data.get("seal_wrap", False)),
-            "External Entropy Access": bool(data.get("external_entropy_access", False)),
-            "Default Lease TTL": format_duration_seconds(config.get("default_lease_ttl"), "system default"),
-            "Max Lease TTL": format_duration_seconds(config.get("max_lease_ttl"), "system default"),
-            "Force No Cache": bool(config.get("force_no_cache", False)),
-            "Listing Visibility": config.get("listing_visibility", ""),
-            "Token Type": config.get("token_type", ""),
-            "Options": data.get("options") or {},
-            "Audit Non-HMAC Request Keys": config.get("audit_non_hmac_request_keys") or [],
-            "Audit Non-HMAC Response Keys": config.get("audit_non_hmac_response_keys") or [],
-            "Passthrough Request Headers": config.get("passthrough_request_headers") or [],
-        }
+        result = dict(data, path=ensure_slash(path))
         self.cache.set(cache_key, result)
         return result
 
@@ -1020,16 +1004,7 @@ class VaultClient:
 
     def read_transit_key(self, mount: str, name: str) -> Dict[str, Any]:
         """Read transit key properties."""
-        data = self.read_logical_data(vault_join(mount, "keys", name))
-        return {
-            "Name": name,
-            "Type": data.get("type", ""),
-            "Latest Version": safe_int(data.get("latest_version")),
-            "Min Decrypt Version": safe_int(data.get("min_decryption_version")),
-            "Min Encrypt Version": safe_int(data.get("min_encryption_version")),
-            "Exportable": bool(data.get("exportable", False)),
-            "Deletion Allowed": bool(data.get("deletion_allowed", False)),
-        }
+        return self.read_logical_data(vault_join(mount, "keys", name))
 
     def list_identity_entities(self) -> List[Dict[str, Any]]:
         """List identity entities and read summaries."""
@@ -1039,8 +1014,8 @@ class VaultClient:
         for entity_id in keys:
             try:
                 entities.append(self.read_identity_entity(str(entity_id)))
-            except VaultError:
-                continue
+            except VaultError as exc:
+                entities.append({"id": str(entity_id), "name": str(entity_id), "error": str(exc)})
         entities.sort(key=lambda item: item.get("name", ""))
         return entities
 
@@ -1052,8 +1027,8 @@ class VaultClient:
         for group_id in keys:
             try:
                 groups.append(self.read_identity_group(str(group_id)))
-            except VaultError:
-                continue
+            except VaultError as exc:
+                groups.append({"id": str(group_id), "name": str(group_id), "error": str(exc)})
         groups.sort(key=lambda item: item.get("name", ""))
         return groups
 
@@ -1088,27 +1063,17 @@ class VaultClient:
             conn = {"name": str(name), "plugin_name": "", "allowed_roles": []}
             try:
                 detail = self.read_db_connection(mount, str(name))
-                conn["plugin_name"] = detail.get("Plugin", "")
-                conn["allowed_roles"] = detail.get("Allowed Roles", [])
-            except VaultError:
-                pass
+                conn["plugin_name"] = detail.get("plugin_name", "")
+                conn["allowed_roles"] = detail.get("allowed_roles", [])
+            except VaultError as exc:
+                conn["error"] = str(exc)
             conns.append(conn)
         conns.sort(key=lambda item: item.get("name", ""))
         return conns
 
     def read_db_connection(self, mount: str, name: str) -> Dict[str, Any]:
         """Read database connection details."""
-        data = self.read_logical_data(vault_join(mount, "config", name))
-        details = data.get("connection_details") or {}
-        return {
-            "Name": name,
-            "Plugin": data.get("plugin_name", ""),
-            "Connection URL": details.get("connection_url", ""),
-            "Allowed Roles": extract_string_list(data, "allowed_roles"),
-            "Root Rotation Statements": extract_string_list(data, "root_credentials_rotate_statements"),
-            "Verify Connection": bool(data.get("verify_connection", False)),
-            "Password Policy": data.get("password_policy", ""),
-        }
+        return self.read_logical_data(vault_join(mount, "config", name))
 
     def list_db_roles(self, mount: str) -> List[Dict[str, Any]]:
         """List dynamic database roles."""
@@ -1121,31 +1086,20 @@ class VaultClient:
                 detail = self.read_db_role(mount, str(name))
                 role.update(
                     {
-                        "db_name": detail.get("DB Name", ""),
-                        "default_ttl": detail.get("Default TTL", ""),
-                        "max_ttl": detail.get("Max TTL", ""),
+                        "db_name": detail.get("db_name", ""),
+                        "default_ttl": extract_duration_field(detail, "default_ttl"),
+                        "max_ttl": extract_duration_field(detail, "max_ttl"),
                     }
                 )
-            except VaultError:
-                pass
+            except VaultError as exc:
+                role["error"] = str(exc)
             roles.append(role)
         roles.sort(key=lambda item: item.get("name", ""))
         return roles
 
     def read_db_role(self, mount: str, name: str) -> Dict[str, Any]:
         """Read dynamic database role details."""
-        data = self.read_logical_data(vault_join(mount, "roles", name))
-        return {
-            "Name": name,
-            "DB Name": data.get("db_name", ""),
-            "Default TTL": extract_duration_field(data, "default_ttl"),
-            "Max TTL": extract_duration_field(data, "max_ttl"),
-            "Role Type": data.get("credential_type", ""),
-            "Creation Statements": extract_string_list(data, "creation_statements"),
-            "Revocation Statements": extract_string_list(data, "revocation_statements"),
-            "Rollback Statements": extract_string_list(data, "rollback_statements"),
-            "Renew Statements": extract_string_list(data, "renew_statements"),
-        }
+        return self.read_logical_data(vault_join(mount, "roles", name))
 
     def list_db_static_roles(self, mount: str) -> List[Dict[str, Any]]:
         """List static database roles."""
@@ -1158,28 +1112,20 @@ class VaultClient:
                 detail = self.read_db_static_role(mount, str(name))
                 role.update(
                     {
-                        "db_name": detail.get("DB Name", ""),
-                        "username": detail.get("Username", ""),
-                        "rotation_period": detail.get("Rotation Period", ""),
+                        "db_name": detail.get("db_name", ""),
+                        "username": detail.get("username", ""),
+                        "rotation_period": extract_duration_field(detail, "rotation_period"),
                     }
                 )
-            except VaultError:
-                pass
+            except VaultError as exc:
+                role["error"] = str(exc)
             roles.append(role)
         roles.sort(key=lambda item: item.get("name", ""))
         return roles
 
     def read_db_static_role(self, mount: str, name: str) -> Dict[str, Any]:
         """Read static database role details."""
-        data = self.read_logical_data(vault_join(mount, "static-roles", name))
-        return {
-            "Name": name,
-            "DB Name": data.get("db_name", ""),
-            "Username": data.get("username", ""),
-            "Rotation Period": extract_duration_field(data, "rotation_period"),
-            "Last Vault Rotation": data.get("last_vault_rotation", ""),
-            "Rotation Statements": extract_string_list(data, "rotation_statements"),
-        }
+        return self.read_logical_data(vault_join(mount, "static-roles", name))
 
     def list_aws_roles(self, mount: str) -> List[Dict[str, Any]]:
         """List AWS roles."""
@@ -1190,53 +1136,44 @@ class VaultClient:
             role = {"name": str(name), "credential_type": "", "policy_arns": []}
             try:
                 detail = self.read_aws_role(mount, str(name))
-                role["credential_type"] = ", ".join(extract_string_list(detail, "Credential Types"))
-                role["policy_arns"] = extract_string_list(detail, "Policy ARNs")
-            except VaultError:
-                pass
+                role["credential_type"] = ", ".join(extract_string_list(detail, "credential_type"))
+                role["policy_arns"] = extract_string_list(detail, "policy_arns")
+            except VaultError as exc:
+                role["error"] = str(exc)
             roles.append(role)
         roles.sort(key=lambda item: item.get("name", ""))
         return roles
 
     def read_aws_role(self, mount: str, name: str) -> Dict[str, Any]:
         """Read AWS role details."""
-        data = self.read_logical_data(vault_join(mount, "roles", name))
-        cred_types = extract_string_list(data, "credential_type")
-        if not cred_types and data.get("credential_type"):
-            cred_types = [str(data.get("credential_type"))]
-        return {
-            "Name": name,
-            "Credential Types": cred_types,
-            "Role ARNs": extract_string_list(data, "role_arns"),
-            "Policy ARNs": extract_string_list(data, "policy_arns"),
-            "Policy Document": data.get("policy_document", ""),
-            "IAM Groups": extract_string_list(data, "iam_groups"),
-            "Default STS TTL": extract_duration_field(data, "default_sts_ttl"),
-            "Max STS TTL": extract_duration_field(data, "max_sts_ttl"),
-            "User Path": data.get("user_path", ""),
-        }
+        return self.read_logical_data(vault_join(mount, "roles", name))
 
     def read_aws_config(self, mount: str) -> Dict[str, Any]:
         """Read AWS root and lease config."""
-        data = {}
-        lease = {}
+        return self.read_sections({name: vault_join(mount, "config", name) for name in ("root", "lease")})
+
+    def read_sections(self, paths: Dict[str, str]) -> Dict[str, Any]:
+        """Read independent configuration sections, retaining endpoint errors."""
+        result: Dict[str, Any] = {}
+        for name, path in paths.items():
+            try:
+                result[name] = self.read_logical_data(path)
+            except VaultError as exc:
+                result[name] = {"error": str(exc), "path": path}
+        return result
+
+    def read_auth_config(self, mount: str) -> Dict[str, Any]:
+        """Read the auth backend configuration and mount tuning independently."""
+        sections = self.read_sections({
+            "configuration": vault_join("auth", mount, "config"),
+            "tuning": vault_join("sys/auth", mount, "tune"),
+        })
         try:
-            data = self.read_logical_data(vault_join(mount, "config/root"))
-        except VaultError:
-            data = {}
-        try:
-            lease = self.read_logical_data(vault_join(mount, "config/lease"))
-        except VaultError:
-            lease = {}
-        return {
-            "Access Key": data.get("access_key", ""),
-            "Region": data.get("region", ""),
-            "IAM Endpoint": data.get("iam_endpoint", ""),
-            "STS Endpoint": data.get("sts_endpoint", ""),
-            "Max Retries": safe_int(data.get("max_retries")),
-            "Lease": lease.get("lease", ""),
-            "Lease Max": lease.get("lease_max", ""),
-        }
+            methods = self.list_auth_methods()
+            sections["mount"] = next((item for item in methods if item["path"] == ensure_slash(mount)), {})
+        except VaultError as exc:
+            sections["mount"] = {"error": str(exc)}
+        return sections
 
     def list_aws_leases(self, mount: str) -> List[Dict[str, Any]]:
         """List active leases under an AWS secrets engine."""
@@ -1248,8 +1185,8 @@ class VaultClient:
             role = str(role_name).rstrip("/")
             try:
                 leases.extend(self._list_aws_role_leases(vault_join(prefix, role)))
-            except VaultError:
-                continue
+            except VaultError as exc:
+                leases.append({"role": role, "lease_id": vault_join(prefix, role), "error": str(exc)})
         leases.sort(key=lambda item: item.get("lease_id", ""))
         return leases
 
@@ -1264,6 +1201,7 @@ class VaultClient:
             role, short = split_lease_id(full_id)
             leases.append(
                 {
+                    **data,
                     "lease_id": full_id,
                     "role": role,
                     "short_id": short,
@@ -1573,6 +1511,25 @@ def clear_area(win: Any, y: int, x: int, height: int, width: int) -> None:
         addstr_safe(win, y + row, x, " " * max(0, width), width)
 
 
+def scroll_indicator(offset: int, visible: int, total: int) -> str:
+    """Describe the visible range and whether more content exists above/below."""
+    total = max(0, total)
+    offset = min(max(0, offset), total)
+    end = min(total, offset + max(0, visible))
+    first = offset + 1 if end > offset else 0
+    above = "^" if offset > 0 else "-"
+    below = "v" if end < total else "-"
+    return "[%s %d-%d/%d %s]" % (above, first, end if first else 0, total, below)
+
+
+def draw_scroll_indicator(win: Any, y: int, x: int, width: int, offset: int,
+                          visible: int, total: int, theme: Theme) -> None:
+    """Place the indicator at the right edge of a header or separator."""
+    text = scroll_indicator(offset, visible, total)
+    addstr_safe(win, y, x + max(0, width - len(text)), text, width,
+                theme.pair(Theme.TITLE, curses.A_BOLD))
+
+
 # ---------------------------------------------------------------------------
 # Keybindings
 # ---------------------------------------------------------------------------
@@ -1582,7 +1539,7 @@ DEFAULT_KEYS: Dict[str, str] = {
     "up": "k,up",
     "down": "j,down",
     "top": "g,home",
-    "bottom": "G,end",
+    "bottom": "end",
     "page_down": "ctrl+d",
     "page_up": "ctrl+u",
     "enter": "enter",
@@ -1590,7 +1547,7 @@ DEFAULT_KEYS: Dict[str, str] = {
     "quit": "q",
     "command": ":",
     "copy": "c",
-    "copy_json": "C",
+    "copy_json": "f4",
 }
 
 
@@ -1614,10 +1571,23 @@ class KeyMap:
         self.bindings = {action: self._split(value) for action, value in merged.items()}
 
     def _split(self, value: str) -> set:
-        return {part.strip() for part in value.split(",") if part.strip()}
+        return {self.shortcut(part.strip()) for part in value.split(",") if part.strip()}
 
-    def token(self, code: int) -> str:
-        """Convert a curses key code into a stable token string."""
+    @staticmethod
+    def shortcut(token: str) -> str:
+        """Normalize shortcut case and Russian ЙЦУКЕН physical key positions."""
+        layout = str.maketrans("йцукенгшщзхъфывапролджэячсмитьбюё", "qwertyuiop[]asdfghjkl;'zxcvbnm,.`")
+        token = token.lower().translate(layout)
+        return {".": "/", ",": "?"}.get(token, token)
+
+    def token(self, code: Union[int, str]) -> str:
+        """Convert a Unicode character or curses special key into a token."""
+        if isinstance(code, str):
+            if len(code) != 1:
+                return code
+            if ord(code) >= 32 and ord(code) != 127:
+                return code
+            code = ord(code)
         if code in (10, 13, curses.KEY_ENTER):
             return "enter"
         if code in (27,):
@@ -1650,6 +1620,10 @@ class KeyMap:
             return "pagedown"
         if code == curses.KEY_PPAGE:
             return "pageup"
+        if code == curses.KEY_F2:
+            return "f2"
+        if code == curses.KEY_F4:
+            return "f4"
         if 0 <= code < 256:
             try:
                 return chr(code)
@@ -1659,7 +1633,7 @@ class KeyMap:
 
     def matches(self, action: str, token: str) -> bool:
         """Return true when a token matches an action."""
-        return token in self.bindings.get(action, set())
+        return self.shortcut(token) in self.bindings.get(action, set())
 
 
 # ---------------------------------------------------------------------------
@@ -1757,11 +1731,11 @@ class Table:
 
     def page(self, direction: int, height: int) -> None:
         """Move by one visible page."""
-        page = max(1, height - 3)
+        page = max(1, height - 2)
         self.move(direction * page, height)
 
     def _ensure_visible(self, height: int) -> None:
-        visible = max(1, height - 3)
+        visible = max(1, height - 2)
         if self.cursor < self.offset:
             self.offset = self.cursor
         if self.cursor >= self.offset + visible:
@@ -1813,6 +1787,8 @@ class Table:
             if self.query:
                 msg = "No rows match /%s" % self.query
             addstr_safe(win, y + 3, x, msg, width, theme.pair(Theme.DIM))
+        if height > 1:
+            draw_scroll_indicator(win, y + 1, x, width, self.offset, visible, len(self.rows), theme)
 
 
 # ---------------------------------------------------------------------------
@@ -1872,6 +1848,15 @@ class TableView(View):
         self.table = Table(self.columns)
         self.filter_active = False
         self.filter_input = ""
+        self.section_errors: Dict[str, str] = {}
+
+    def read_collection(self, name: str, loader: Callable[[], List[Any]]) -> List[Any]:
+        """Keep available collections when another collection cannot be read."""
+        try:
+            return loader()
+        except VaultError as exc:
+            self.section_errors[name] = str(exc)
+            return []
 
     def rows_and_items(self, app: "VaultTUI") -> Tuple[List[List[Any]], List[Any]]:
         """Return table rows and backing items."""
@@ -1893,9 +1878,14 @@ class TableView(View):
             None: Исключения перехватываются для отображения на экране.
         """
         try:
+            self.section_errors = {}
             rows, items = self.rows_and_items(app)
             self.table.set_rows(rows, items)
-            self.error = ""
+            for item in items:
+                if isinstance(item, dict) and item.get("error"):
+                    name = str(item.get("name") or item.get("id") or item.get("lease_id") or "item")
+                    self.section_errors[name] = str(item["error"])
+            self.error = "; ".join("%s: %s" % pair for pair in self.section_errors.items())
         except Exception as exc:
             self.error = str(exc)
 
@@ -1905,6 +1895,10 @@ class TableView(View):
     def extra_key(self, app: "VaultTUI", token: str) -> bool:
         """Handle view-specific keys."""
         return False
+
+    def navigation_height(self, app: "VaultTUI") -> int:
+        """Return the table's height, including its column headers."""
+        return max(0, app.body_height - 2)
 
     def handle_key(self, app: "VaultTUI", token: str) -> bool:
         """Handle navigation, filtering, refresh, and enter."""
@@ -1926,28 +1920,29 @@ class TableView(View):
             return True
 
         if app.keys.matches("up", token):
-            self.table.move(-1, app.body_height)
+            self.table.move(-1, self.navigation_height(app))
             return True
         if app.keys.matches("down", token):
-            self.table.move(1, app.body_height)
+            self.table.move(1, self.navigation_height(app))
             return True
         if app.keys.matches("top", token):
             self.table.top()
             return True
         if app.keys.matches("bottom", token):
-            self.table.bottom(app.body_height)
+            self.table.bottom(self.navigation_height(app))
             return True
         if app.keys.matches("page_down", token) or token == "pagedown":
-            self.table.page(1, app.body_height)
+            self.table.page(1, self.navigation_height(app))
             return True
         if app.keys.matches("page_up", token) or token == "pageup":
-            self.table.page(-1, app.body_height)
+            self.table.page(-1, self.navigation_height(app))
             return True
         if token == "/":
             self.filter_active = True
             self.filter_input = self.table.query
             return True
         if token == "r":
+            app.client.cache.clear()
             self.load(app)
             app.status("refreshed")
             return True
@@ -2007,11 +2002,8 @@ class DetailView(View):
         """Convert detail data to table rows."""
         rows: List[List[Any]] = []
         for key, value in data.items():
-            if isinstance(value, list):
-                value = "\n".join(stringify(item) for item in value)
-            elif isinstance(value, dict):
-                value = json.dumps(value, sort_keys=True, ensure_ascii=False)
-            rows.append([key, value_or_dash(value)])
+            text = json.dumps(value, ensure_ascii=False, default=json_default) if not isinstance(value, str) else value
+            rows.append([key, text if text else '""'])
         return rows
 
     def load(self, app: "VaultTUI") -> None:
@@ -2046,14 +2038,27 @@ class DetailView(View):
             self.raw_format = fmt
             self.raw_scroll = 0
 
-    def raw_lines(self) -> List[str]:
+    def raw_payload(self) -> Dict[str, Any]:
+        """Return complete data for JSON/YAML viewing and copying."""
+        return self.data
+
+    def raw_lines(self, width: Optional[int] = None) -> List[str]:
         """Return raw rendered lines."""
-        return render_raw(self.data, self.raw_format).splitlines()
+        text = render_raw(self.raw_payload(), self.raw_format)
+        return wrap_lines(text, width) if width else text.splitlines()
 
     def handle_key(self, app: "VaultTUI", token: str) -> bool:
         """Handle table/raw navigation and copy."""
+        if token == "r":
+            app.client.cache.clear()
+            self.load(app)
+            app.status("refreshed")
+            return True
+        if app.keys.matches("copy_json", token):
+            app.copy_text(render_raw(self.raw_payload(), "json"), "copied JSON")
+            return True
         if self.raw_mode:
-            lines = self.raw_lines()
+            lines = self.raw_lines(app.body_width)
             body = max(1, app.body_height - 2)
             if app.keys.matches("up", token):
                 self.raw_scroll = max(0, self.raw_scroll - 1)
@@ -2074,9 +2079,9 @@ class DetailView(View):
                 self.raw_scroll = max(0, self.raw_scroll - body)
                 return True
             if token == "c":
-                app.copy_text(render_raw(self.data, self.raw_format), "%s copied" % self.raw_format.upper())
+                app.copy_text(render_raw(self.raw_payload(), self.raw_format), "%s copied" % self.raw_format.upper())
                 return True
-            if token == "J":
+            if token == "f2":
                 self.toggle_raw("json")
                 return True
             if token == "y":
@@ -2088,26 +2093,39 @@ class DetailView(View):
             return False
 
         if app.keys.matches("up", token):
-            self.table.move(-1, app.body_height)
+            self.table.move(-1, max(0, app.body_height - 2))
             return True
         if app.keys.matches("down", token):
-            self.table.move(1, app.body_height)
+            self.table.move(1, max(0, app.body_height - 2))
             return True
         if app.keys.matches("top", token):
             self.table.top()
             return True
         if app.keys.matches("bottom", token):
-            self.table.bottom(app.body_height)
+            self.table.bottom(max(0, app.body_height - 2))
             return True
-        if token == "J":
+        if app.keys.matches("page_down", token) or token == "pagedown":
+            self.table.page(1, max(0, app.body_height - 2))
+            return True
+        if app.keys.matches("page_up", token) or token == "pageup":
+            self.table.page(-1, max(0, app.body_height - 2))
+            return True
+        if app.keys.matches("enter", token) or app.keys.matches("copy", token):
+            selected = self.table.selected()
+            if selected:
+                key = selected[0]
+                value = self.data[key]
+                text = value if isinstance(value, str) else render_raw(value, "json")
+                if app.keys.matches("copy", token):
+                    app.copy_text(text, "copied %s" % key)
+                else:
+                    app.push(TextView(self.title + " / " + key, text))
+            return True
+        if token == "f2":
             self.toggle_raw("json")
             return True
         if token == "y":
             self.toggle_raw("yaml")
-            return True
-        if token == "r":
-            self.load(app)
-            app.status("refreshed")
             return True
         return False
 
@@ -2122,20 +2140,23 @@ class DetailView(View):
             addstr_safe(win, y + 2, 0, "Error: " + self.error, width, app.theme.pair(Theme.ERROR))
             return
         if self.raw_mode:
-            lines = self.raw_lines()
+            lines = self.raw_lines(width)
             body_y = y + 2
             body_h = max(0, height - 2)
+            self.raw_scroll = min(self.raw_scroll, max(0, len(lines) - body_h))
             end = min(len(lines), self.raw_scroll + body_h)
             for row, line in enumerate(lines[self.raw_scroll : end]):
                 addstr_safe(win, body_y + row, 0, line, width)
+            if height > 1:
+                draw_scroll_indicator(win, y + 1, 0, width, self.raw_scroll, body_h, len(lines), app.theme)
             return
         self.table.render(win, y + 2, 0, max(0, height - 2), width, app.theme)
 
     def hints(self) -> List[Tuple[str, str]]:
         """Return detail view key hints."""
         if self.raw_mode:
-            return [("up/down", "scroll"), ("c", "copy raw"), ("J/y", "json/yaml"), ("esc", "table")]
-        return [("up/down", "navigate"), ("J/y", "raw"), ("r", "refresh"), ("esc", "back")]
+            return [("up/down", "scroll"), ("c", "copy raw"), ("F2/y", "json/yaml"), ("esc", "table")]
+        return [("enter", "full value"), ("c/F4", "copy value/JSON"), ("F2/y", "raw"), ("r", "refresh"), ("esc", "back")]
 
 
 class TextView(View):
@@ -2196,7 +2217,8 @@ class TextView(View):
         if token == "c":
             app.copy_text(self.text, "copied")
             return True
-        if token == "r" and self.loader:
+        if token == "r":
+            app.client.cache.clear()
             self.load(app)
             app.status("refreshed")
             return True
@@ -2219,6 +2241,8 @@ class TextView(View):
         self.scroll = min(self.scroll, max_scroll)
         for row, line in enumerate(lines[self.scroll : self.scroll + body_h]):
             addstr_safe(win, y + 2 + row, 0, line, width)
+        if height > 1:
+            draw_scroll_indicator(win, y + 1, 0, width, self.scroll, body_h, len(lines), app.theme)
 
     def hints(self) -> List[Tuple[str, str]]:
         """Return text view hints."""
@@ -2252,6 +2276,7 @@ class DashboardView(View):
 
     def load(self, app: "VaultTUI") -> None:
         """Fetch dashboard status and resource counts."""
+        self.count_errors = []
         try:
             self.health = app.client.health()
             self.error = ""
@@ -2261,14 +2286,15 @@ class DashboardView(View):
 
         try:
             self.seal = app.client.seal_status()
-        except Exception:
+        except Exception as exc:
             self.seal = {}
+            self.count_errors.append("Seal status: %s" % exc)
         try:
             self.ha = app.client.ha_status()
-        except Exception:
+        except Exception as exc:
             self.ha = {}
+            self.count_errors.append("HA status: %s" % exc)
 
-        self.count_errors = []
         self.counts = {}
         for label, loader in (
             ("Secret Engines", app.client.list_secret_engines),
@@ -2280,6 +2306,23 @@ class DashboardView(View):
             except Exception as exc:
                 self.counts[label] = -1
                 self.count_errors.append("%s: %s" % (label, exc))
+
+    def handle_key(self, app: "VaultTUI", token: str) -> bool:
+        if token == "r":
+            app.client.cache.clear()
+            self.load(app)
+            return True
+        if token in ("enter", "d", "f2", "y"):
+            def load_details(current_app: "VaultTUI") -> Dict[str, Any]:
+                self.load(current_app)
+                return {"health": self.health, "seal_status": self.seal, "ha_status": self.ha,
+                        "resources": self.counts, "errors": ([self.error] if self.error else []) + self.count_errors}
+            view = MappingLoaderDetailView("Overview / Full status", load_details)
+            app.push(view)
+            if token in ("f2", "y"):
+                view.toggle_raw("json" if token == "f2" else "yaml")
+            return True
+        return False
 
     def render(self, app: "VaultTUI", win: Any, y: int, height: int, width: int) -> None:
         """Render dashboard panels."""
@@ -2321,19 +2364,10 @@ class DashboardView(View):
         for err in self.count_errors[:2]:
             addstr_safe(win, row, 2, fit(err, width - 2), width - 2, app.theme.pair(Theme.DIM))
             row += 1
-        row += 2
-        quick = [
-            "1 Secret Engines   2 Auth Methods   3 Policies",
-            "4 Identity         5 PKI            6 Transit",
-            "7 Database         8 AWS            : command",
-        ]
-        addstr_safe(win, row, 2, "Quick navigation", width - 2, app.theme.pair(Theme.ACCENT, curses.A_BOLD))
-        for idx, line in enumerate(quick):
-            addstr_safe(win, row + 1 + idx, 2, line, width - 2)
 
     def hints(self) -> List[Tuple[str, str]]:
         """Return dashboard hints."""
-        return [("1-8", "quick nav"), (":", "command"), ("?", "help"), ("q", "quit")]
+        return [("enter", "full status"), ("b", "resources"), ("r", "refresh"), (":", "command"), ("?", "help")]
 
 
 class EnginesView(TableView):
@@ -2369,23 +2403,27 @@ class EnginesView(TableView):
             app.push(DatabaseView(mount))
         elif typ == "aws":
             app.push(AWSView(mount))
+        elif typ == "identity":
+            app.push(IdentityView())
+        elif typ == "system":
+            app.open_resources(DashboardView())
         else:
             app.push(PathBrowserView(mount, "", item.get("version") == "v2"))
 
     def extra_key(self, app: "VaultTUI", token: str) -> bool:
-        if token in ("d", "J", "y"):
+        if token in ("d", "f2", "y"):
             item = self.table.selected()
             if not item:
                 return True
             view = EngineDetailView(item.get("path", ""))
             app.push(view)
-            if token in ("J", "y"):
-                view.toggle_raw("json" if token == "J" else "yaml")
+            if token in ("f2", "y"):
+                view.toggle_raw("json" if token == "f2" else "yaml")
             return True
         return False
 
     def hints(self) -> List[Tuple[str, str]]:
-        return [("up/down", "navigate"), ("enter", "browse"), ("d", "describe"), ("J/y", "raw"), ("esc", "back")]
+        return [("up/down", "navigate"), ("enter", "browse"), ("d", "describe"), ("F2/y", "raw"), ("esc", "back")]
 
 
 class EngineDetailView(DetailView):
@@ -2441,17 +2479,17 @@ class PathBrowserView(TableView):
             app.push(SecretDetailView(self.mount, new_path, self.kv_v2))
 
     def extra_key(self, app: "VaultTUI", token: str) -> bool:
-        if token in ("J", "y"):
+        if token in ("f2", "y"):
             item = self.table.selected()
             if item and not item.get("is_dir"):
                 view = SecretDetailView(self.mount, self.sub_path + item.get("name", ""), self.kv_v2)
                 app.push(view)
-                view.toggle_raw("json" if token == "J" else "yaml")
+                view.toggle_raw("json" if token == "f2" else "yaml")
             return True
         return False
 
     def hints(self) -> List[Tuple[str, str]]:
-        return [("up/down", "navigate"), ("enter", "open"), ("J/y", "raw"), ("esc", "back")]
+        return [("up/down", "navigate"), ("enter", "open"), ("F2/y", "raw"), ("esc", "back")]
 
 
 class SecretDetailView(DetailView):
@@ -2494,6 +2532,9 @@ class SecretDetailView(DetailView):
 
     def handle_key(self, app: "VaultTUI", token: str) -> bool:
         if not self.raw_mode:
+            if token == "m" and self.kv_v2:
+                app.push(APIReadView(vault_join(self.mount, "metadata", self.sub_path)))
+                return True
             if app.keys.matches("copy", token):
                 selected = self.table.selected()
                 if selected:
@@ -2511,9 +2552,10 @@ class SecretDetailView(DetailView):
     def hints(self) -> List[Tuple[str, str]]:
         if self.raw_mode:
             return super().hints()
-        hints = [("up/down", "navigate"), ("c", "copy value"), ("C", "copy JSON"), ("J/y", "raw")]
+        hints = [("up/down", "navigate"), ("c", "copy value"), ("F4", "copy JSON"), ("F2/y", "raw")]
         if self.kv_v2:
             hints.append(("v", "versions"))
+            hints.append(("m", "metadata"))
         hints.append(("esc", "back"))
         return hints
 
@@ -2604,14 +2646,96 @@ class DiffView(TextView):
 class PoliciesView(TableView):
     """ACL policies browser.
 
-    EN: Lists ACL policies and opens policy body views.
-    RU: Показывает ACL policies и открывает тело policy.
+    EN: Lists ACL policies above a preview of the selected policy body.
+    RU: Показывает список ACL policies и содержимое выбранной policy под ним.
     """
 
     columns = [Column("Name", 30, True), Column("Type", 10)]
 
     def __init__(self) -> None:
         super().__init__("Policies")
+        self.preview: Optional[PolicyDetailView] = None
+
+    def load(self, app: "VaultTUI") -> None:
+        super().load(app)
+        self.update_preview(app, force=True)
+
+    def update_preview(self, app: "VaultTUI", force: bool = False) -> None:
+        """Read only when selection changes or the user requests a refresh."""
+        name = self.table.selected()
+        if name is None:
+            self.preview = None
+        elif force or self.preview is None or self.preview.name != name:
+            self.preview = PolicyDetailView(name)
+            self.preview.load(app)
+
+    def navigation_height(self, app: "VaultTUI") -> int:
+        upper = max(1, app.body_height // 2)
+        # Compact terminals omit table headers, leaving one title and actual rows.
+        return upper - 2 if upper >= 5 else upper + 1
+
+    def preview_lines(self, width: int) -> List[str]:
+        if self.preview is None:
+            return []
+        return wrap_lines(self.preview.error or self.preview.text or "Policy has no body.", width)
+
+    def handle_key(self, app: "VaultTUI", token: str) -> bool:
+        if not self.filter_active and token in ("pageup", "pagedown"):
+            if self.preview:
+                visible = max(1, app.body_height - max(1, app.body_height // 2) - 1)
+                lines = self.preview_lines(app.body_width)
+                delta = visible if token == "pagedown" else -visible
+                self.preview.scroll = max(0, min(max(0, len(lines) - visible), self.preview.scroll + delta))
+            return True
+        if not self.filter_active and app.keys.matches("copy", token):
+            if self.preview and not self.preview.error:
+                app.copy_text(self.preview.text, "copied policy %s" % self.preview.name)
+            return True
+        handled = super().handle_key(app, token)
+        self.update_preview(app)
+        return handled
+
+    def render(self, app: "VaultTUI", win: Any, y: int, height: int, width: int) -> None:
+        """Keep the policy list and selected policy body visible together."""
+        if height <= 0:
+            return
+        upper = max(1, height // 2)
+        table_height = upper - 2 if upper >= 5 else upper + 1
+        self.table._ensure_visible(table_height)
+        if upper >= 5:
+            super().render(app, win, y, upper, width)
+        else:
+            clear_area(win, y, 0, upper, width)
+            title = "/ " + self.filter_input + "_" if self.filter_active else self.title
+            indicator = scroll_indicator(self.table.offset, upper - 1, len(self.table.rows))
+            addstr_safe(win, y, 0, title, max(0, width - len(indicator) - 1), app.theme.pair(Theme.TITLE, curses.A_BOLD))
+            for row, index in enumerate(range(self.table.offset, min(len(self.table.rows), self.table.offset + upper - 1))):
+                attr = app.theme.pair(Theme.SELECTED) if index == self.table.cursor else 0
+                addstr_safe(win, y + 1 + row, 0, self.table.rows[index][0], width, attr)
+            draw_scroll_indicator(win, y, 0, width, self.table.offset, upper - 1, len(self.table.rows), app.theme)
+        lower = height - upper
+        clear_area(win, y + upper, 0, lower, width)
+        if lower <= 0:
+            return
+        title = " Policy: %s " % self.preview.name if self.preview else " No policy selected "
+        lines = self.preview_lines(width)
+        visible = max(0, lower - 1)
+        if self.preview:
+            self.preview.scroll = min(self.preview.scroll, max(0, len(lines) - visible))
+        offset = self.preview.scroll if self.preview else 0
+        indicator = scroll_indicator(offset, visible, len(lines))
+        title_width = max(0, width - len(indicator))
+        addstr_safe(win, y + upper, 0, fit(title, title_width).rstrip().center(title_width, "-"), title_width, app.theme.pair(Theme.TITLE, curses.A_BOLD))
+        draw_scroll_indicator(win, y + upper, 0, width, offset, visible, len(lines), app.theme)
+        if not self.preview:
+            return
+        attr = app.theme.pair(Theme.ERROR) if self.preview.error else 0
+        for row, line in enumerate(lines[self.preview.scroll:self.preview.scroll + visible]):
+            addstr_safe(win, y + upper + 1 + row, 0, line, width, attr)
+
+    def hints(self) -> List[Tuple[str, str]]:
+        return [("up/down", "select"), ("PgUp/PgDn", "preview"), ("enter", "full screen"),
+                ("/", "filter"), ("c", "copy"), ("r", "refresh"), ("esc", "back")]
 
     def rows_and_items(self, app: "VaultTUI") -> Tuple[List[List[Any]], List[Any]]:
         policies = app.client.list_policies()
@@ -2619,6 +2743,17 @@ class PoliciesView(TableView):
 
     def open_selected(self, app: "VaultTUI", item: str) -> None:
         app.push(PolicyDetailView(item))
+
+    def extra_key(self, app: "VaultTUI", token: str) -> bool:
+        if token in ("d", "f2", "y"):
+            item = self.table.selected()
+            if item:
+                view = APIReadView(vault_join("sys/policies/acl", item))
+                app.push(view)
+                if token in ("f2", "y"):
+                    view.toggle_raw("json" if token == "f2" else "yaml")
+            return True
+        return False
 
 
 class PolicyDetailView(TextView):
@@ -2658,7 +2793,45 @@ class AuthMethodsView(TableView):
         return rows, methods
 
     def open_selected(self, app: "VaultTUI", item: Dict[str, Any]) -> None:
-        app.push(StaticDetailView("Auth: " + item.get("path", ""), item))
+        app.push(AuthDetailView(item.get("path", ""), item.get("type", "")))
+
+    def extra_key(self, app: "VaultTUI", token: str) -> bool:
+        if token in ("d", "f2", "y", "b"):
+            item = self.table.selected()
+            if item:
+                view = AuthDetailView(item.get("path", ""), item.get("type", ""))
+                if token == "b":
+                    app.open_resources(view)
+                else:
+                    app.push(view)
+                    if token in ("f2", "y"):
+                        view.toggle_raw("json" if token == "f2" else "yaml")
+            return True
+        return False
+
+    def hints(self) -> List[Tuple[str, str]]:
+        return [("enter", "configuration"), ("b", "resources"), ("F2/y", "raw"), ("r", "refresh"), ("esc", "back")]
+
+
+class AuthDetailView(DetailView):
+    """Complete backend configuration, mount metadata, and tuning."""
+
+    def __init__(self, mount: str, auth_type: str) -> None:
+        super().__init__("Auth: " + mount)
+        self.mount = ensure_slash(mount)
+        self.auth_type = auth_type
+        self.sections: Dict[str, Any] = {}
+
+    def fetch_data(self, app: "VaultTUI") -> Dict[str, Any]:
+        self.sections = app.client.read_auth_config(self.mount)
+        return {
+            **self.sections["configuration"],
+            "[mount]": self.sections["mount"],
+            "[tuning]": self.sections["tuning"],
+        }
+
+    def raw_payload(self) -> Dict[str, Any]:
+        return self.sections
 
 
 class StaticDetailView(DetailView):
@@ -2674,6 +2847,110 @@ class StaticDetailView(DetailView):
 
     def fetch_data(self, app: "VaultTUI") -> Dict[str, Any]:
         return dict(self.static_data)
+
+
+class APIReadView(DetailView):
+    """Read any exact Vault API path without dropping the response envelope."""
+
+    def __init__(self, path: str, params: Optional[Dict[str, Any]] = None) -> None:
+        self.path = path.strip("/")
+        self.params = params
+        self.response: Dict[str, Any] = {}
+        super().__init__("Read: " + self.path)
+
+    def fetch_data(self, app: "VaultTUI") -> Dict[str, Any]:
+        response = app.client.read(self.path, params=self.params)
+        if response is None:
+            raise VaultError("no data found at %s" % self.path)
+        self.response = response
+        data = response.get("data", response)
+        return data if isinstance(data, dict) else {"data": data}
+
+    def raw_payload(self) -> Dict[str, Any]:
+        return self.response
+
+
+class APIListView(TableView):
+    """LIST collection with explicit read/list actions and complete list metadata."""
+
+    columns = [Column("Key", 32, True), Column("Info", 40, True)]
+
+    def __init__(self, path: str, read_prefix: str = "") -> None:
+        self.path = path.strip("/")
+        self.read_prefix = read_prefix.strip("/") or self.path
+        self.response: Dict[str, Any] = {}
+        super().__init__("List: " + self.path)
+
+    def rows_and_items(self, app: "VaultTUI") -> Tuple[List[List[Any]], List[Any]]:
+        response = app.client.list(self.path)
+        if response is None:
+            raise VaultError("no list found at %s" % self.path)
+        self.response = response
+        data = response.get("data") or {}
+        info = data.get("key_info") or {}
+        keys = data.get("keys") or []
+        return [[key, info.get(key, "")] for key in keys], keys
+
+    def open_selected(self, app: "VaultTUI", item: str) -> None:
+        if item.endswith("/"):
+            app.push(APIListView(vault_join(self.path, item), vault_join(self.read_prefix, item)))
+        else:
+            app.push(APIReadView(vault_join(self.read_prefix, item)))
+
+    def extra_key(self, app: "VaultTUI", token: str) -> bool:
+        item = self.table.selected()
+        if token == "l":
+            if item:
+                app.push(APIListView(vault_join(self.path, item)))
+            return True
+        if token == "d":
+            if item:
+                app.push(APIReadView(vault_join(self.read_prefix, item)))
+            return True
+        if token in ("f2", "y"):
+            view = StaticDetailView(self.title + " response", self.response)
+            app.push(view)
+            view.toggle_raw("json" if token == "f2" else "yaml")
+            return True
+        return False
+
+    def hints(self) -> List[Tuple[str, str]]:
+        return [("enter", "open"), ("l", "list child"), ("d", "read child"), ("F2/y", "full response"), ("r", "refresh"), ("esc", "back")]
+
+
+class EndpointBrowserView(TableView):
+    """Discover common configuration and resource paths for the current section."""
+
+    columns = [Column("Operation", 10), Column("API path", 48, True)]
+
+    def __init__(self, title: str, endpoints: Sequence[Tuple[str, str, str]]) -> None:
+        super().__init__(title + " / Resources")
+        self.endpoints = endpoints
+
+    def rows_and_items(self, app: "VaultTUI") -> Tuple[List[List[Any]], List[Any]]:
+        return [[method, path] for method, path, _ in self.endpoints], list(self.endpoints)
+
+    def open_selected(self, app: "VaultTUI", item: Tuple[str, str, str]) -> None:
+        method, path, read_prefix = item
+        app.push(APIListView(path, read_prefix) if method == "LIST" else APIReadView(path))
+
+
+class MountSelectorView(TableView):
+    """Select any mounted instance of a backend, including custom mount paths."""
+
+    columns = [Column("Mount", 30, True), Column("Description", 40, True)]
+
+    def __init__(self, engine_type: str) -> None:
+        super().__init__("Select mount: " + engine_type)
+        self.engine_type = engine_type
+
+    def rows_and_items(self, app: "VaultTUI") -> Tuple[List[List[Any]], List[Any]]:
+        mounts = [item for item in app.client.list_secret_engines() if item.get("type") == self.engine_type]
+        return [[item["path"], item.get("description", "")] for item in mounts], mounts
+
+    def open_selected(self, app: "VaultTUI", item: Dict[str, Any]) -> None:
+        cls = {"pki": PKIView, "transit": TransitView, "database": DatabaseView, "aws": AWSView}[self.engine_type]
+        app.push(cls(item["path"]))
 
 
 class PKIView(TableView):
@@ -2695,8 +2972,8 @@ class PKIView(TableView):
         self.table = Table(self.cert_columns)
 
     def rows_and_items(self, app: "VaultTUI") -> Tuple[List[List[Any]], List[Any]]:
-        self.certs = app.client.list_pki_certs(self.mount)
-        self.roles = app.client.list_pki_roles(self.mount)
+        self.certs = self.read_collection("Certificates", lambda: app.client.list_pki_certs(self.mount))
+        self.roles = self.read_collection("Roles", lambda: app.client.list_pki_roles(self.mount))
         return self._current_rows()
 
     def _current_rows(self) -> Tuple[List[List[Any]], List[Any]]:
@@ -2721,6 +2998,14 @@ class PKIView(TableView):
             self.tab = (self.tab + 1) % 2
             self._rebuild_tab()
             return True
+        if token in ("f2", "y"):
+            item = self.table.selected()
+            if item:
+                self.open_selected(app, item)
+                view = app.current()
+                if isinstance(view, DetailView):
+                    view.toggle_raw("json" if token == "f2" else "yaml")
+            return True
         return False
 
     def render(self, app: "VaultTUI", win: Any, y: int, height: int, width: int) -> None:
@@ -2731,33 +3016,16 @@ class PKIView(TableView):
         return [("up/down", "navigate"), ("tab", "switch tab"), ("enter", "view"), ("esc", "back")]
 
 
-class PKICertDetailView(TextView):
-    """PKI PEM certificate viewer.
-
-    EN: Shows PEM certificate content and optional CA/revocation details.
-    RU: Показывает PEM-сертификат и дополнительные CA/revocation детали.
-    """
+class PKICertDetailView(DetailView):
+    """Complete certificate response, including PEM, chain and revocation fields."""
 
     def __init__(self, mount: str, serial: str) -> None:
         self.mount = ensure_slash(mount)
         self.serial = serial
         super().__init__("Certificate: " + serial)
 
-    def load(self, app: "VaultTUI") -> None:
-        try:
-            data = app.client.read_pki_cert(self.mount, self.serial)
-            cert = data.get("certificate", "")
-            chain = data.get("ca_chain", "")
-            revocation = data.get("revocation_time", "")
-            chunks = [cert]
-            if chain:
-                chunks.append("\nCA Chain:\n" + stringify(chain))
-            if revocation:
-                chunks.append("\nRevocation: " + stringify(revocation))
-            self.text = "\n".join(chunk for chunk in chunks if chunk)
-            self.error = ""
-        except Exception as exc:
-            self.error = str(exc)
+    def fetch_data(self, app: "VaultTUI") -> Dict[str, Any]:
+        return app.client.read_pki_cert(self.mount, self.serial)
 
 
 class TransitView(TableView):
@@ -2781,12 +3049,12 @@ class TransitView(TableView):
         app.push(TransitKeyDetailView(self.mount, item.get("name", "")))
 
     def extra_key(self, app: "VaultTUI", token: str) -> bool:
-        if token in ("J", "y"):
+        if token in ("f2", "y"):
             item = self.table.selected()
             if item:
                 view = TransitKeyDetailView(self.mount, item.get("name", ""))
                 app.push(view)
-                view.toggle_raw("json" if token == "J" else "yaml")
+                view.toggle_raw("json" if token == "f2" else "yaml")
             return True
         return False
 
@@ -2825,8 +3093,8 @@ class IdentityView(TableView):
         self.table = Table(self.entity_columns)
 
     def rows_and_items(self, app: "VaultTUI") -> Tuple[List[List[Any]], List[Any]]:
-        self.entities = app.client.list_identity_entities()
-        self.groups = app.client.list_identity_groups()
+        self.entities = self.read_collection("Entities", app.client.list_identity_entities)
+        self.groups = self.read_collection("Groups", app.client.list_identity_groups)
         return self._current_rows()
 
     def _current_rows(self) -> Tuple[List[List[Any]], List[Any]]:
@@ -2848,12 +3116,12 @@ class IdentityView(TableView):
             self.tab = (self.tab + 1) % 2
             self._rebuild_tab()
             return True
-        if token in ("J", "y"):
+        if token in ("f2", "y"):
             item = self.table.selected()
             if item:
                 view = IdentityDetailView(self.tab == 0, item.get("id", ""), item.get("name", ""))
                 app.push(view)
-                view.toggle_raw("json" if token == "J" else "yaml")
+                view.toggle_raw("json" if token == "f2" else "yaml")
             return True
         return False
 
@@ -2862,7 +3130,7 @@ class IdentityView(TableView):
         super().render(app, win, y, height, width)
 
     def hints(self) -> List[Tuple[str, str]]:
-        return [("up/down", "navigate"), ("tab", "switch tab"), ("enter", "view"), ("J/y", "raw"), ("esc", "back")]
+        return [("up/down", "navigate"), ("tab", "switch tab"), ("enter", "view"), ("F2/y", "raw"), ("esc", "back")]
 
 
 class IdentityDetailView(DetailView):
@@ -2880,17 +3148,8 @@ class IdentityDetailView(DetailView):
 
     def fetch_data(self, app: "VaultTUI") -> Dict[str, Any]:
         if self.is_entity:
-            entity = app.client.read_identity_entity(self.item_id)
-            return {"Name": entity.get("name"), "ID": entity.get("id"), "Policies": entity.get("policies"), "Raw": entity.get("raw")}
-        group = app.client.read_identity_group(self.item_id)
-        return {
-            "Name": group.get("name"),
-            "ID": group.get("id"),
-            "Policies": group.get("policies"),
-            "Type": group.get("type"),
-            "Members": group.get("member_entity_ids"),
-            "Raw": group.get("raw"),
-        }
+            return app.client.read_identity_entity(self.item_id)["raw"]
+        return app.client.read_identity_group(self.item_id)["raw"]
 
 
 class MappingLoaderDetailView(DetailView):
@@ -2929,9 +3188,9 @@ class DatabaseView(TableView):
         self.table = Table(self.conn_columns)
 
     def rows_and_items(self, app: "VaultTUI") -> Tuple[List[List[Any]], List[Any]]:
-        self.conns = app.client.list_db_connections(self.mount)
-        self.roles = app.client.list_db_roles(self.mount)
-        self.static_roles = app.client.list_db_static_roles(self.mount)
+        self.conns = self.read_collection("Connections", lambda: app.client.list_db_connections(self.mount))
+        self.roles = self.read_collection("Roles", lambda: app.client.list_db_roles(self.mount))
+        self.static_roles = self.read_collection("Static Roles", lambda: app.client.list_db_static_roles(self.mount))
         return self._current_rows()
 
     def _current_rows(self) -> Tuple[List[List[Any]], List[Any]]:
@@ -2962,7 +3221,7 @@ class DatabaseView(TableView):
             self.tab = (self.tab + 1) % 3
             self._rebuild_tab()
             return True
-        if token in ("J", "y"):
+        if token in ("f2", "y"):
             item = self.table.selected()
             if item:
                 name = item.get("name", "")
@@ -2974,7 +3233,7 @@ class DatabaseView(TableView):
                 else:
                     view = DBStaticRoleDetailView(self.mount, name)
                 app.push(view)
-                view.toggle_raw("json" if token == "J" else "yaml")
+                view.toggle_raw("json" if token == "f2" else "yaml")
             return True
         return False
 
@@ -2984,7 +3243,7 @@ class DatabaseView(TableView):
         super().render(app, win, y, height, width)
 
     def hints(self) -> List[Tuple[str, str]]:
-        return [("up/down", "navigate"), ("tab", "switch tab"), ("enter", "view"), ("J/y", "raw"), ("esc", "back")]
+        return [("up/down", "navigate"), ("tab", "switch tab"), ("enter", "view"), ("F2/y", "raw"), ("esc", "back")]
 
 
 class DBConnectionDetailView(DetailView):
@@ -3056,9 +3315,9 @@ class AWSView(TableView):
         self.table = Table(self.role_columns)
 
     def rows_and_items(self, app: "VaultTUI") -> Tuple[List[List[Any]], List[Any]]:
-        self.roles = app.client.list_aws_roles(self.mount)
+        self.roles = self.read_collection("Roles", lambda: app.client.list_aws_roles(self.mount))
         self.config = app.client.read_aws_config(self.mount)
-        self.leases = app.client.list_aws_leases(self.mount)
+        self.leases = self.read_collection("Leases", lambda: app.client.list_aws_leases(self.mount))
         return self._current_rows()
 
     def _current_rows(self) -> Tuple[List[List[Any]], List[Any]]:
@@ -3080,6 +3339,9 @@ class AWSView(TableView):
     def open_selected(self, app: "VaultTUI", item: Dict[str, Any]) -> None:
         if self.tab == 0:
             app.push(AWSRoleDetailView(self.mount, item.get("name", "")))
+        elif self.tab == 1:
+            name = item["key"]
+            app.push(APIReadView(vault_join(self.mount, "config", name)))
         elif self.tab == 2:
             app.push(StaticDetailView("Lease: " + item.get("role", ""), item))
 
@@ -3088,16 +3350,18 @@ class AWSView(TableView):
             self.tab = (self.tab + 1) % 3
             self._rebuild_tab()
             return True
-        if token in ("J", "y"):
+        if token in ("f2", "y"):
             item = self.table.selected()
-            if item and self.tab in (0, 2):
+            if item:
                 view: DetailView
                 if self.tab == 0:
                     view = AWSRoleDetailView(self.mount, item.get("name", ""))
+                elif self.tab == 1:
+                    view = APIReadView(vault_join(self.mount, "config", item["key"]))
                 else:
                     view = StaticDetailView("Lease: " + item.get("role", ""), item)
                 app.push(view)
-                view.toggle_raw("json" if token == "J" else "yaml")
+                view.toggle_raw("json" if token == "f2" else "yaml")
             return True
         return False
 
@@ -3107,7 +3371,7 @@ class AWSView(TableView):
         super().render(app, win, y, height, width)
 
     def hints(self) -> List[Tuple[str, str]]:
-        return [("up/down", "navigate"), ("tab", "switch tab"), ("enter", "view"), ("J/y", "raw"), ("r", "refresh"), ("esc", "back")]
+        return [("up/down", "navigate"), ("tab", "switch tab"), ("enter", "view"), ("F2/y", "raw"), ("r", "refresh"), ("esc", "back")]
 
 
 class AWSRoleDetailView(DetailView):
@@ -3137,24 +3401,7 @@ class TokenInspectorView(DetailView):
         super().__init__("Token Inspector")
 
     def fetch_data(self, app: "VaultTUI") -> Dict[str, Any]:
-        data = app.client.inspect_token()
-        return {
-            "Type": data.get("type") or "service (default)",
-            "Display Name": data.get("display_name", ""),
-            "Accessor": data.get("accessor", ""),
-            "Policies": data.get("policies") or [],
-            "Renewable": bool(data.get("renewable", False)),
-            "Orphan": bool(data.get("orphan", False)),
-            "Num Uses": "unlimited" if safe_int(data.get("num_uses")) == 0 else safe_int(data.get("num_uses")),
-            "TTL Remaining": format_duration_seconds(data.get("ttl"), "infinity (no expiry)"),
-            "Creation TTL": format_duration_seconds(data.get("creation_ttl"), "infinity (no expiry)"),
-            "Max TTL": format_duration_seconds(data.get("explicit_max_ttl"), "infinity (no expiry)"),
-            "Created": data.get("creation_time", ""),
-            "Expires": data.get("expire_time", "") or "never",
-            "Entity ID": data.get("entity_id", ""),
-            "Auth Path": data.get("path", ""),
-            "Meta": data.get("meta") or {},
-        }
+        return app.client.inspect_token()
 
 
 class ContextsView(TableView):
@@ -3183,8 +3430,19 @@ class ContextsView(TableView):
     def open_selected(self, app: "VaultTUI", item: Dict[str, Any]) -> None:
         app.switch_context(item)
 
+    def extra_key(self, app: "VaultTUI", token: str) -> bool:
+        if token in ("d", "f2", "y"):
+            item = self.table.selected()
+            if item:
+                view = StaticDetailView("Context: " + item.get("name", ""), item)
+                app.push(view)
+                if token in ("f2", "y"):
+                    view.toggle_raw("json" if token == "f2" else "yaml")
+            return True
+        return False
+
     def hints(self) -> List[Tuple[str, str]]:
-        return [("up/down", "navigate"), ("enter", "switch"), ("esc", "back")]
+        return [("up/down", "navigate"), ("enter", "switch"), ("d", "details"), ("F2/y", "raw"), ("esc", "back")]
 
 
 # ---------------------------------------------------------------------------
@@ -3210,6 +3468,18 @@ class VaultTUI:
         curses.error: Может возникнуть при ошибках инициализации terminal.
     """
 
+    TABS = (
+        ("0", "Overview", DashboardView, ()),
+        ("1", "Secrets", EnginesView, ()),
+        ("2", "Auth", AuthMethodsView, ()),
+        ("3", "Policies", PoliciesView, ()),
+        ("4", "Identity", IdentityView, ()),
+        ("5", "PKI", PKIView, ("pki/",)),
+        ("6", "Transit", TransitView, ("transit/",)),
+        ("7", "Database", DatabaseView, ("database/",)),
+        ("8", "AWS", AWSView, ("aws/",)),
+    )
+
     def __init__(self, client: VaultClient, config: RuntimeConfig) -> None:
         self.client = client
         self.config = config
@@ -3217,6 +3487,8 @@ class VaultTUI:
         self.theme = Theme()
         self.clipboard = Clipboard()
         self.stack: List[View] = []
+        self.active_tab = "0"
+        self.tab_stacks: Dict[str, List[View]] = {}
         self.command_active = False
         self.command_input = ""
         self.command_error = ""
@@ -3237,14 +3509,24 @@ class VaultTUI:
         view.load(self)
 
     def pop(self) -> None:
-        """Pop a view while keeping the root dashboard."""
+        """Go back within the tab, or return to the overview."""
         if len(self.stack) > 1:
             self.stack.pop()
+        elif self.active_tab != "0":
+            self.quick_jump("0")
 
     def reset_to(self, view: View) -> None:
-        """Reset navigation to dashboard plus the selected view."""
-        root = self.stack[0] if self.stack else DashboardView()
-        self.stack = [root]
+        """Open a command destination in its corresponding tab."""
+        key = next((key for key, _, cls, _ in self.TABS if isinstance(view, cls)), None)
+        if key is None:
+            key = "1" if isinstance(view, (PathBrowserView, SecretDetailView)) else "0"
+        self.tab_stacks[self.active_tab] = self.stack
+        self.active_tab = key
+        self.stack = []
+        self.tab_stacks[key] = self.stack
+        if not any(isinstance(view, cls) for _, _, cls, _ in self.TABS):
+            _, _, cls, args = next(tab for tab in self.TABS if tab[0] == key)
+            self.push(cls(*args))
         self.push(view)
 
     def current(self) -> View:
@@ -3265,6 +3547,83 @@ class VaultTUI:
             self.status("%s; clipboard clears in %ss" % (message, self.config.clipboard_timeout))
         except Exception as exc:
             self.status("copy failed: %s" % exc, 5.0)
+
+    def open_resources(self, view: View) -> None:
+        """Expose common read/list endpoints without automatically reading them."""
+        endpoints: List[Tuple[str, str, str]] = []
+
+        def add(method: str, path: str, read_prefix: str = "") -> None:
+            endpoints.append((method, path.strip("/"), read_prefix))
+
+        anchor = view
+        if isinstance(view, AuthMethodsView):
+            item = view.table.selected()
+            if item:
+                anchor = AuthDetailView(item["path"], item["type"])
+        if isinstance(anchor, AuthDetailView):
+            base = vault_join("auth", anchor.mount)
+            add("READ", vault_join(base, "config"))
+            add("READ", vault_join("sys/auth", anchor.mount, "tune"))
+            collections = {
+                "ldap": ("users", "groups"), "userpass": ("users",),
+                "approle": ("role",), "jwt": ("role",), "oidc": ("role",),
+                "kubernetes": ("role",), "cert": ("certs",), "aws": ("roles",),
+                "azure": ("role",), "github": ("map/users", "map/teams"),
+                "radius": ("users",), "token": ("roles",),
+            }
+            for path in collections.get(anchor.auth_type, ()):
+                read_prefix = vault_join(base, "role") if anchor.auth_type == "aws" and path == "roles" else ""
+                add("LIST", vault_join(base, path), read_prefix)
+            if anchor.auth_type == "aws":
+                for path in ("config/client", "config/identity"):
+                    add("READ", vault_join(base, path))
+        else:
+            mount = getattr(view, "mount", "")
+            typ = ""
+            if isinstance(view, EnginesView):
+                item = view.table.selected()
+                if item:
+                    mount, typ = item["path"], item["type"]
+            candidates = [view] + list(reversed(self.stack))
+            for candidate in candidates:
+                for cls, engine_type in ((PKIView, "pki"), (TransitView, "transit"),
+                                         (DatabaseView, "database"), (AWSView, "aws")):
+                    if isinstance(candidate, cls):
+                        typ = typ or engine_type
+                        mount = mount or candidate.mount
+            if mount:
+                if not typ:
+                    try:
+                        typ = next((item["type"] for item in self.client.list_secret_engines() if item["path"] == mount), "")
+                    except VaultError as exc:
+                        self.status(str(exc), 5)
+                add("READ", vault_join("sys/mounts", mount))
+                add("READ", vault_join("sys/mounts", mount, "tune"))
+                paths = {
+                    "pki": (("LIST", "certs", "cert"), ("LIST", "roles", ""),
+                            ("LIST", "issuers", "issuer"), ("LIST", "keys", "key"),
+                            ("READ", "config/urls", ""), ("READ", "config/crl", ""),
+                            ("READ", "config/cluster", ""), ("READ", "config/auto-tidy", "")),
+                    "transit": (("LIST", "keys", ""), ("READ", "cache-config", "")),
+                    "database": (("LIST", "config", ""), ("LIST", "roles", ""), ("LIST", "static-roles", "")),
+                    "aws": (("LIST", "roles", ""), ("READ", "config/root", ""), ("READ", "config/lease", "")),
+                    "kv": (("READ", "config", ""), ("LIST", "metadata", "data")),
+                }
+                for method, path, read_prefix in paths.get(typ, ()):
+                    add(method, vault_join(mount, path), vault_join(mount, read_prefix) if read_prefix else "")
+            elif self.active_tab == "3":
+                for kind in ("acl", "rgp", "egp"):
+                    add("LIST", "sys/policies/" + kind)
+            elif self.active_tab == "4" or any(isinstance(candidate, IdentityView) for candidate in candidates):
+                for path in ("entity/id", "group/id", "entity-alias/id", "group-alias/id", "oidc/key", "oidc/role", "oidc/assignment"):
+                    add("LIST", "identity/" + path)
+            elif self.active_tab == "2":
+                add("READ", "sys/auth")
+            else:
+                for path in ("sys/health", "sys/seal-status", "sys/leader", "sys/ha-status",
+                             "sys/mounts", "sys/auth", "sys/audit", "auth/token/lookup-self"):
+                    add("READ", path)
+        self.push(EndpointBrowserView(view.title, endpoints))
 
     def refresh_health(self) -> None:
         """Refresh header health status at most every 30 seconds."""
@@ -3296,8 +3655,10 @@ class VaultTUI:
         while self.running:
             self.refresh_health()
             self.draw(stdscr)
-            code = stdscr.getch()
-            if code == -1:
+            try:
+                code = stdscr.get_wch()
+            except curses.error:
+                # get_wch reports the configured input timeout as curses.error.
                 continue
             token = self.keys.token(code)
             self.handle_token(token)
@@ -3311,14 +3672,16 @@ class VaultTUI:
             stdscr.refresh()
             return
 
-        header_h = 1
+        tab_rows = self.tab_layout(width)
+        header_h = 1 + len(tab_rows) + 1
         status_h = 1
         cmd_h = 1 if self.command_active else 0
         self.body_height = height - header_h - status_h - cmd_h
         self.body_width = width
 
         self.draw_header(stdscr, 0, width)
-        body_y = 1
+        self.draw_tabs(stdscr, 1, width, tab_rows)
+        body_y = header_h
         if self.help_active:
             self.draw_help(stdscr, body_y, self.body_height, width)
         else:
@@ -3338,10 +3701,36 @@ class VaultTUI:
         else:
             status = "connecting"
         version = self.health.get("version", "") if self.health else ""
+        color = Theme.ERROR if self.health_error or status == "sealed" else Theme.OK if self.health else Theme.ACCENT
+        addstr_safe(win, y, 0, "*", 1, self.theme.pair(color, curses.A_BOLD))
         text = " VaultUI | %s | ns: %s | %s" % (self.client.address, ns, status)
         if version:
             text += " | v" + str(version)
-        addstr_safe(win, y, 0, fit(text, width), width, self.theme.pair(Theme.HEADER, curses.A_BOLD))
+        addstr_safe(win, y, 1, text, width - 1, self.theme.pair(Theme.TITLE, curses.A_BOLD))
+
+    def tab_layout(self, width: int) -> List[List[Tuple[str, str]]]:
+        """Wrap whole tab labels to keep every shortcut visible."""
+        rows: List[List[Tuple[str, str]]] = [[]]
+        used = 0
+        for key, label, _, _ in self.TABS:
+            text = " [%s] %s " % (key, label)
+            if rows[-1] and used + len(text) > width:
+                rows.append([])
+                used = 0
+            rows[-1].append((key, text))
+            used += len(text)
+        return rows
+
+    def draw_tabs(self, win: Any, y: int, width: int, rows: List[List[Tuple[str, str]]]) -> None:
+        """Draw persistent numbered tabs above the current screen."""
+        for row, tabs in enumerate(rows):
+            x = 0
+            for key, text in tabs:
+                active = key == self.active_tab
+                attr = self.theme.pair(Theme.TITLE, curses.A_BOLD | curses.A_REVERSE) if active else self.theme.pair(Theme.DIM)
+                addstr_safe(win, y + row, x, text, min(len(text), width - x), attr)
+                x += len(text)
+        addstr_safe(win, y + len(rows), 0, "-" * width, width, self.theme.pair(Theme.DIM))
 
     def draw_command(self, win: Any, y: int, width: int) -> None:
         """Draw command palette input."""
@@ -3362,7 +3751,10 @@ class VaultTUI:
             text = "esc/? close"
         else:
             hints = self.current().hints()
-            text = "  ".join("%s %s" % (key, desc) for key, desc in hints)
+            common = "0-8 tabs  b resources  "
+            if self.active_tab in ("5", "6", "7", "8"):
+                common += "m mounts  "
+            text = common + "  ".join("%s %s" % (key, desc) for key, desc in hints if key != "b")
         addstr_safe(win, y, 0, fit(text, width), width, self.theme.pair(Theme.STATUS))
 
     def draw_help(self, win: Any, y: int, height: int, width: int) -> None:
@@ -3372,8 +3764,12 @@ class VaultTUI:
             "Help",
             "",
             "General: q quit, ctrl+c force quit, ? help, : command, esc back",
-            "Navigation: j/k or arrows, g/G, ctrl+d/ctrl+u, enter open",
-            "Quick jump: 1 secrets, 2 auth, 3 policies, 4 identity, 5 pki, 6 transit, 7 db, 8 aws",
+            "Navigation: j/k or arrows, g/End, ctrl+d/ctrl+u, enter open",
+            "Tabs: 0 overview, 1 secrets, 2 auth, 3 policies, 4 identity, 5 pki, 6 transit, 7 db, 8 aws",
+            "Tabs remember their screen and selection; r refreshes the current view.",
+            "Details: enter full value, c copy value, F4 copy JSON, F2/y complete JSON/YAML",
+            "Resources: b API paths, m select PKI/Transit/Database/AWS mount, ! full error",
+            "API: :read auth/ldap/config, :list auth/ldap/groups (exact Vault paths)",
             "Command palette: :secrets :auth :policies :identity :pki :transit :db :aws :token :ctx :dash :quit",
             "Path jump: :go mount/path",
             "",
@@ -3407,6 +3803,12 @@ class VaultTUI:
         if self.command_active:
             self.handle_command_key(token)
             return
+        if not self.help_active:
+            view = self.current()
+            if isinstance(view, TableView) and view.filter_active:
+                view.handle_key(self, token)
+                return
+        token = self.keys.shortcut(token)
         if self.help_active:
             if token in ("?", "esc") or self.keys.matches("back", token):
                 self.help_active = False
@@ -3424,10 +3826,19 @@ class VaultTUI:
             self.command_input = ""
             self.command_error = ""
             return
-        if token in tuple("12345678"):
+        if token in tuple("012345678"):
             self.quick_jump(token)
             return
         if self.current().handle_key(self, token):
+            return
+        if token == "b":
+            self.open_resources(self.current())
+            return
+        if token == "!" and self.current().error:
+            self.push(TextView("Error / " + self.current().title, self.current().error))
+            return
+        if token == "m" and self.active_tab in ("5", "6", "7", "8"):
+            self.push(MountSelectorView({"5": "pki", "6": "transit", "7": "database", "8": "aws"}[self.active_tab]))
             return
         if self.keys.matches("back", token):
             self.pop()
@@ -3474,6 +3885,8 @@ class VaultTUI:
             "token",
             "transit",
             "go ",
+            "read ",
+            "list ",
         ]
         if not prefix:
             return commands
@@ -3496,8 +3909,7 @@ class VaultTUI:
             None: Errors are displayed inside the command palette.
             None: Ошибки отображаются внутри command palette.
         """
-        # EN: Commands reset to root for jump-like navigation, matching numeric jumps.
-        # RU: Команды сбрасывают стек к root для jump-навигации, как цифровые переходы.
+        # Commands open their destination; numeric tabs restore saved navigation.
         self.command_active = False
         self.command_input = ""
         self.command_error = ""
@@ -3528,6 +3940,22 @@ class VaultTUI:
                 self.reset_to(ContextsView())
             elif command.startswith("go "):
                 self.go_to_path(command[3:].strip())
+            elif command == "read" or command.startswith("read "):
+                args = shlex.split(command[4:].strip())
+                if not args:
+                    raise VaultError("path required: read <Vault API path> [key=value ...]")
+                params: Dict[str, Any] = {}
+                for argument in args[1:]:
+                    key, separator, value = argument.partition("=")
+                    if not separator or not key:
+                        raise VaultError("read parameters must use key=value")
+                    params[key] = value
+                self.push(APIReadView(args[0], params or None))
+            elif command == "list" or command.startswith("list "):
+                path = command[4:].strip()
+                if not path:
+                    raise VaultError("path required: list <Vault API path>")
+                self.push(APIListView(path))
             else:
                 self.command_active = True
                 self.command_input = command
@@ -3538,18 +3966,15 @@ class VaultTUI:
             self.command_error = str(exc)
 
     def quick_jump(self, token: str) -> None:
-        """Handle numeric quick navigation."""
-        views: Dict[str, View] = {
-            "1": EnginesView(),
-            "2": AuthMethodsView(),
-            "3": PoliciesView(),
-            "4": IdentityView(),
-            "5": PKIView("pki/"),
-            "6": TransitView("transit/"),
-            "7": DatabaseView("database/"),
-            "8": AWSView("aws/"),
-        }
-        self.reset_to(views[token])
+        """Switch tabs, loading on first use and preserving each view stack."""
+        if token == self.active_tab and self.stack:
+            return
+        _, _, cls, args = next(tab for tab in self.TABS if tab[0] == token)
+        self.tab_stacks[self.active_tab] = self.stack
+        self.active_tab = token
+        self.stack = self.tab_stacks.setdefault(token, [])
+        if not self.stack:
+            self.push(cls(*args))
 
     def go_to_path(self, full_path: str) -> None:
         """Jump to a Vault secret path."""
@@ -3604,6 +4029,10 @@ class VaultTUI:
         self.config.raw_config["current_context"] = ctx.get("name", "")
         save_config(self.config.config_path, self.config.raw_config)
         self.health_checked_at = 0
+        self.health = {}
+        self.health_error = ""
+        self.tab_stacks.clear()
+        self.active_tab = "0"
         self.stack = []
         self.push(DashboardView())
         self.status("switched to context %s" % ctx.get("name", ""))
