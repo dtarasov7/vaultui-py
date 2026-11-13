@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format follows the spirit of Keep a Changelog, and this project uses semantic versioning.
 
+## [1.2.0] - 2026-11-13
+
+### Added
+
+- LDAP authentication with `--auth-method ldap` and custom auth mount support.
+- Hidden password prompts for LDAP and userpass when omitted from CLI/configuration. Supported at TUI startup, in headless mode, and during context switching; entered passwords are not saved to configuration.
+
+### Fixed
+
+- Connection options passed before `get` are no longer overwritten by subcommand defaults.
+
 ## [1.1.0] - 2026-11-11
 
 ### Added

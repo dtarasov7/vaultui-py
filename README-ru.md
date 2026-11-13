@@ -1,6 +1,6 @@
 # VaultUI Python
 
-[![Версия](https://img.shields.io/badge/version-1.1.0-blue.svg)](CHANGELOG-ru.md)
+[![Версия](https://img.shields.io/badge/version-1.2.0-blue.svg)](CHANGELOG-ru.md)
 
 VaultUI Python — это однофайловый TUI для HashiCorp Vault на Python 3.8. Он повторяет основные рабочие сценарии оригинального Go-проекта `vaultui`, но использует минимум зависимостей: CLI, HTTP-запросы, curses-интерфейс, буфер обмена и JSON-вывод реализованы средствами стандартной библиотеки Python.
 
@@ -11,7 +11,7 @@ VaultUI Python — это однофайловый TUI для HashiCorp Vault н
 - Браузер KV v2 с переходом по каталогам, просмотром secrets, копированием значений, историей версий и diff между версиями.
 - Экраны policies, auth methods, PKI, Transit, Identity, Database, AWS и token inspector.
 - Переключение контекстов через `~/.vaultui.yaml`.
-- Аутентификация через token, userpass и AppRole.
+- Аутентификация через token, userpass, LDAP и AppRole; скрытый запрос отсутствующего пароля для userpass и LDAP.
 - Command palette с командами `:secrets`, `:auth`, `:policies`, `:identity`, `:pki`, `:transit`, `:db`, `:aws`, `:token`, `:ctx` и `:go`.
 - Настраиваемые keybindings.
 - Clipboard с автоочисткой скопированных secrets.
@@ -107,6 +107,14 @@ contexts:
       role_id: "xxx"
       secret_id: "yyy"
 
+  - name: corporate
+    address: https://vault.example.com
+    auth:
+      method: ldap
+      mount_path: ldap
+      username: alice
+      # Пароль будет запрошен при подключении.
+
 settings:
   clipboard_timeout: 30
   keybindings:
@@ -120,8 +128,19 @@ settings:
 ./vaultui-py.py --vault-addr https://vault.example.com --token s.xxxxx
 ./vaultui-py.py --namespace admin
 ./vaultui-py.py --auth-method userpass --username admin --password secret
+./vaultui-py.py --auth-method userpass --username admin
+./vaultui-py.py --auth-method ldap --username alice
+./vaultui-py.py --auth-method ldap --auth-mount corporate-ldap --username alice
 ./vaultui-py.py --auth-method approle --role-id xxx --secret-id yyy
 ```
+
+Если для `userpass` или `ldap` пароль не задан через `--password` или в
+`auth.password` контекста, программа запросит его без отображения символов.
+Это работает при запуске TUI, в headless-режиме и при переключении контекста
+через `:ctx`. Введённый пароль не записывается в конфигурацию.
+По умолчанию используются mount-ы `userpass` и `ldap`; для другого пути
+укажите `--auth-mount` или `auth.mount_path`. Имя пользователя обязательно.
+При отсутствии терминала для скрытого ввода задайте пароль явно.
 
 Headless JSON-режим:
 

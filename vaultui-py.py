@@ -31,6 +31,7 @@ PyYAML необязателен. Если он недоступен, испол�
 import argparse
 import curses
 import difflib
+import getpass
 import json
 import os
 import shlex
@@ -41,6 +42,7 @@ import textwrap
 import threading
 import time
 import traceback
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -50,7 +52,7 @@ from urllib.request import Request, urlopen
 
 
 APP_NAME = "VaultUI Python"
-__VERSION__ = "1.1.0"
+__VERSION__ = "1.2.0"
 __AUTHOR__ = "Dmitry Tarasov"
 
 DEFAULT_CONFIG_NAME = ".vaultui.yaml"
@@ -438,12 +440,12 @@ class RuntimeConfig:
         address (str): Vault base URL.
         token (str): Vault token resolved from flags/env/config/token file.
         namespace (str): Optional Vault Enterprise namespace.
-        auth_method (str): token, userpass, or approle.
+        auth_method (str): token, userpass, ldap, or approle.
         clipboard_timeout (int): Secret auto-clear timeout in seconds.
         address (str): Базовый URL Vault.
         token (str): Токен Vault из флагов/env/config/token file.
         namespace (str): Необязательный namespace Vault Enterprise.
-        auth_method (str): token, userpass или approle.
+        auth_method (str): token, userpass, ldap или approle.
         clipboard_timeout (int): Таймаут автоочистки секретов в секундах.
 
     Returns:
@@ -560,6 +562,19 @@ class VaultError(Exception):
         VaultError: Exception raised to CLI/TUI boundaries.
         VaultError: Исключение, передаваемое на границы CLI/TUI.
     """
+
+
+def prompt_auth_password(method: str, username: str) -> str:
+    """Request a password without echo; refuse getpass's visible-input fallback."""
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            password = getpass.getpass("%s password for %s: " % (method, username))
+    except (EOFError, getpass.GetPassWarning) as exc:
+        raise VaultError("cannot read a hidden %s password; use an interactive terminal or --password" % method) from exc
+    if not password:
+        raise VaultError("%s password cannot be empty" % method)
+    return password
 
 
 class TTLCache:
@@ -745,20 +760,22 @@ class VaultClient:
         password: str = "",
         role_id: str = "",
         secret_id: str = "",
+        password_prompt: Optional[Callable[[str, str], str]] = None,
     ) -> None:
-        """Authenticate with token, userpass, or AppRole.
+        """Authenticate with token, userpass, LDAP, or AppRole.
 
         Args:
-            method (str): token, userpass, or approle.
+            method (str): token, userpass, ldap, or approle.
             mount_path (str): Optional auth mount override.
-            username (str): Userpass username.
-            password (str): Userpass password.
+            username (str): Userpass or LDAP username.
+            password (str): Password; missing values are requested without echo.
             role_id (str): AppRole role_id.
             secret_id (str): Optional AppRole secret_id.
-            method (str): token, userpass или approle.
+            password_prompt: Optional TUI-aware password input callback.
+            method (str): token, userpass, ldap или approle.
             mount_path (str): Необязательный override auth mount.
-            username (str): Username для userpass.
-            password (str): Password для userpass.
+            username (str): Username для userpass или LDAP.
+            password (str): Пароль; при отсутствии запрашивается без отображения.
             role_id (str): role_id для AppRole.
             secret_id (str): Необязательный secret_id для AppRole.
 
@@ -773,12 +790,14 @@ class VaultClient:
         method = method or "token"
         if method == "token":
             return
-        if method == "userpass":
+        if method in ("userpass", "ldap"):
             if not username:
-                raise VaultError("userpass auth requires --username")
+                raise VaultError("%s auth requires --username" % method)
             if not password:
-                raise VaultError("userpass auth requires --password")
-            mount = mount_path or "userpass"
+                password = (password_prompt or prompt_auth_password)(method, username)
+            if not password:
+                raise VaultError("%s password cannot be empty" % method)
+            mount = mount_path or method
             response = self.write(vault_join("auth", mount, "login", username), {"password": password})
         elif method == "approle":
             if not role_id:
@@ -3501,6 +3520,7 @@ class VaultTUI:
         self.health_error = ""
         self.health_checked_at = 0.0
         self.running = True
+        self.screen: Optional[Any] = None
         self.renewer = TokenRenewer(client)
 
     def push(self, view: View) -> None:
@@ -3642,9 +3662,11 @@ class VaultTUI:
         try:
             curses.wrapper(self._run)
         finally:
+            self.screen = None
             self.renewer.stop()
 
     def _run(self, stdscr: Any) -> None:
+        self.screen = stdscr
         curses.curs_set(0)
         curses.noecho()
         curses.cbreak()
@@ -4024,6 +4046,7 @@ class VaultTUI:
                 password=auth.get("password", ""),
                 role_id=auth.get("role_id", ""),
                 secret_id=auth.get("secret_id", ""),
+                password_prompt=self.prompt_auth_password,
             )
         self.client = client
         self.config.raw_config["current_context"] = ctx.get("name", "")
@@ -4036,6 +4059,20 @@ class VaultTUI:
         self.stack = []
         self.push(DashboardView())
         self.status("switched to context %s" % ctx.get("name", ""))
+
+    def prompt_auth_password(self, method: str, username: str) -> str:
+        """Temporarily suspend curses while getpass reads the new context password."""
+        if self.screen is None:
+            return prompt_auth_password(method, username)
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            return prompt_auth_password(method, username)
+        finally:
+            curses.reset_prog_mode()
+            curses.noecho()
+            curses.curs_set(0)
+            self.screen.clearok(True)
 
 
 # ---------------------------------------------------------------------------
@@ -4108,30 +4145,36 @@ def headless_get(client: VaultClient, resource: str, path: str = "") -> None:
         raise VaultError("unknown resource: %s (try: health, engines, auth, policies, secret, policy, token)" % resource)
 
 
-def add_global_args(parser: argparse.ArgumentParser) -> None:
+def add_global_args(parser: argparse.ArgumentParser, suppress_defaults: bool = False) -> None:
     """Add global CLI flags.
 
     Args:
         parser (argparse.ArgumentParser): Parser receiving shared flags.
+        suppress_defaults (bool): Keep previously parsed global values in subcommands.
         parser (argparse.ArgumentParser): Parser, получающий общие флаги.
 
     Returns:
         None.
         Нет.
     """
-    parser.add_argument("--config", default="", help="config file (default $HOME/.vaultui.yaml)")
-    parser.add_argument("--context", default="", help="config context name")
-    parser.add_argument("--vault-addr", default=None, help="Vault server address")
-    parser.add_argument("--token", default=None, help="Vault authentication token")
-    parser.add_argument("--namespace", default=None, help="Vault namespace")
-    parser.add_argument("--auth-method", default=None, choices=["token", "userpass", "approle"], help="Auth method")
-    parser.add_argument("--auth-mount", default=None, help="Custom auth mount path")
-    parser.add_argument("--username", default=None, help="Username for userpass auth")
-    parser.add_argument("--password", default=None, help="Password for userpass auth")
-    parser.add_argument("--role-id", default=None, help="Role ID for AppRole auth")
-    parser.add_argument("--secret-id", default=None, help="Secret ID for AppRole auth")
-    parser.add_argument("--insecure", action="store_true", help="skip TLS certificate verification")
-    parser.add_argument("--timeout", type=float, default=20.0, help="HTTP timeout in seconds")
+    def add_argument(*flags: str, **kwargs: Any) -> None:
+        if suppress_defaults:
+            kwargs["default"] = argparse.SUPPRESS
+        parser.add_argument(*flags, **kwargs)
+
+    add_argument("--config", default="", help="config file (default $HOME/.vaultui.yaml)")
+    add_argument("--context", default="", help="config context name")
+    add_argument("--vault-addr", default=None, help="Vault server address")
+    add_argument("--token", default=None, help="Vault authentication token")
+    add_argument("--namespace", default=None, help="Vault namespace")
+    add_argument("--auth-method", default=None, choices=["token", "userpass", "ldap", "approle"], help="Auth method")
+    add_argument("--auth-mount", default=None, help="Custom auth mount path")
+    add_argument("--username", default=None, help="Username for userpass or LDAP auth")
+    add_argument("--password", default=None, help="Password for userpass or LDAP auth (prompted if omitted)")
+    add_argument("--role-id", default=None, help="Role ID for AppRole auth")
+    add_argument("--secret-id", default=None, help="Secret ID for AppRole auth")
+    add_argument("--insecure", action="store_true", help="skip TLS certificate verification")
+    add_argument("--timeout", type=float, default=20.0, help="HTTP timeout in seconds")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -4154,7 +4197,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="store_true", help="show version and exit")
     sub = parser.add_subparsers(dest="subcommand")
-    get = sub.add_parser("get", parents=[parent], help="get Vault resources as JSON")
+    get = sub.add_parser("get", help="get Vault resources as JSON")
+    add_global_args(get, suppress_defaults=True)
     get.add_argument("resource", help="health, engines, auth, policies, secret, policy, token")
     get.add_argument("path", nargs="?", default="", help="secret path or policy name")
     get.add_argument("-o", "--output", default="json", choices=["json"], help="output format")

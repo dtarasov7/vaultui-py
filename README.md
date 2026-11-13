@@ -1,6 +1,6 @@
 # VaultUI Python
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](CHANGELOG.md)
 
 VaultUI Python is a single-file Python 3.8 terminal UI for HashiCorp Vault. It mirrors the main workflows of the original Go `vaultui` project while keeping runtime dependencies minimal: the application uses the Python standard library for CLI parsing, HTTP requests, curses rendering, clipboard integration, and JSON output.
 
@@ -11,7 +11,7 @@ VaultUI Python is a single-file Python 3.8 terminal UI for HashiCorp Vault. It m
 - KV v2 browser with directory navigation, secret detail views, clipboard copy, version history, and version diffs.
 - Policy, auth method, PKI, Transit, Identity, Database, AWS, and token inspection screens.
 - Context switching through `~/.vaultui.yaml`.
-- Token, userpass, and AppRole authentication.
+- Token, userpass, LDAP, and AppRole authentication, with hidden password prompts for userpass and LDAP when omitted.
 - Command palette with `:secrets`, `:auth`, `:policies`, `:identity`, `:pki`, `:transit`, `:db`, `:aws`, `:token`, `:ctx`, and `:go`.
 - Configurable keybindings.
 - Clipboard auto-clear for copied secrets.
@@ -107,6 +107,14 @@ contexts:
       role_id: "xxx"
       secret_id: "yyy"
 
+  - name: corporate
+    address: https://vault.example.com
+    auth:
+      method: ldap
+      mount_path: ldap
+      username: alice
+      # Password is requested when connecting.
+
 settings:
   clipboard_timeout: 30
   keybindings:
@@ -120,8 +128,18 @@ settings:
 ./vaultui-py.py --vault-addr https://vault.example.com --token s.xxxxx
 ./vaultui-py.py --namespace admin
 ./vaultui-py.py --auth-method userpass --username admin --password secret
+./vaultui-py.py --auth-method userpass --username admin
+./vaultui-py.py --auth-method ldap --username alice
+./vaultui-py.py --auth-method ldap --auth-mount corporate-ldap --username alice
 ./vaultui-py.py --auth-method approle --role-id xxx --secret-id yyy
 ```
+
+For `userpass` and `ldap`, omitting both `--password` and the context's
+`auth.password` triggers a hidden password prompt. This works at TUI startup,
+in headless mode, and when switching contexts with `:ctx`. Entered passwords
+are not saved to configuration. Default mounts are `userpass` and `ldap`;
+use `--auth-mount` or `auth.mount_path` for custom paths. A username is required.
+If no terminal is available for hidden input, supply the password explicitly.
 
 Headless JSON mode:
 
